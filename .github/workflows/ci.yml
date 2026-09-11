@@ -1,0 +1,155 @@
+name: CI
+
+on:
+  push:
+  pull_request:
+    branches:
+      - main
+      - Develop
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  lint:
+    name: Lint
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+          cache-dependency-path: |
+            pyproject.toml
+            backend/requirements/base.txt
+            backend/requirements/dev.txt
+
+      - name: Install development dependencies
+        run: python -m pip install -r backend/requirements/dev.txt
+
+      - name: Run Ruff linter
+        run: python -m ruff check backend tests
+
+      - name: Check Ruff formatting
+        run: python -m ruff format --check backend tests
+
+  typecheck:
+    name: Type check
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+          cache-dependency-path: |
+            pyproject.toml
+            backend/requirements/base.txt
+            backend/requirements/dev.txt
+
+      - name: Install development dependencies
+        run: python -m pip install -r backend/requirements/dev.txt
+
+      - name: Run MyPy
+        run: python -m mypy backend --ignore-missing-imports
+
+  tests:
+    name: Tests
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+          cache-dependency-path: |
+            pyproject.toml
+            backend/requirements/base.txt
+            backend/requirements/dev.txt
+
+      - name: Install development dependencies
+        run: python -m pip install -r backend/requirements/dev.txt
+
+      - name: Run test suite
+        run: python -m pytest -q
+
+  docker:
+    name: Docker image matrix
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: api-gateway
+            dockerfile: backend/apps/api-gateway/Dockerfile
+          - name: account-service
+            dockerfile: backend/services/account-service/Dockerfile
+          - name: bot-service
+            dockerfile: backend/services/bot-service/Dockerfile
+          - name: market-data-service
+            dockerfile: backend/services/market-data-service/Dockerfile
+          - name: strategy-ai-service
+            dockerfile: backend/services/strategy-ai-service/Dockerfile
+          - name: risk-service
+            dockerfile: backend/services/risk-service/Dockerfile
+          - name: execution-service
+            dockerfile: backend/services/execution-service/Dockerfile
+          - name: position-service
+            dockerfile: backend/services/position-service/Dockerfile
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Build ${{ matrix.name }} image
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: ${{ matrix.dockerfile }}
+          push: false
+          tags: echelon-quant/${{ matrix.name }}:${{ github.sha }}
+          cache-from: type=gha,scope=${{ matrix.name }}
+          cache-to: type=gha,mode=max,scope=${{ matrix.name }}
+
+  docker-status:
+    name: Docker build
+    if: ${{ always() }}
+    needs: docker
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - name: Require every Docker image build to pass
+        if: ${{ needs.docker.result != 'success' }}
+        run: exit 1
+
+      - name: Docker builds passed
+        run: echo "All Docker image builds passed."
