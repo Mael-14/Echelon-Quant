@@ -69,7 +69,14 @@ jobs:
         run: python -m pip install -r backend/requirements/dev.txt
 
       - name: Run MyPy
-        run: python -m mypy backend --ignore-missing-imports
+        shell: bash
+        run: |
+          set -euo pipefail
+          python -m mypy backend/shared --ignore-missing-imports --explicit-package-bases
+          while IFS= read -r app_dir; do
+            echo "Type-checking ${app_dir}"
+            python -m mypy "${app_dir}" --ignore-missing-imports --explicit-package-bases
+          done < <(find backend/apps backend/services -type d -name app -print)
 
   tests:
     name: Tests
