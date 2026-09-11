@@ -43,7 +43,7 @@ class Settings(BaseSettings):
         case_sensitive=False,
     )
 
-    @computed_field
+    @computed_field  # type: ignore[prop-decorator]
     @property
     def is_development(self) -> bool:
         return self.environment.lower() == "development"
