@@ -25,6 +25,12 @@ class Settings(BaseSettings):
     redis_stream_order_events: str = Field(default="order-events")
     redis_stream_position_events: str = Field(default="position-events")
     redis_stream_risk_events: str = Field(default="risk-events")
+    # Deriv authentication (optional)
+    deriv_token: str | None = Field(default=None)
+    deriv_account_id: str | None = Field(default=None)
+    deriv_app_id: int | None = Field(default=None)
+    # Symmetric key (base64 urlsafe) used to encrypt stored Deriv tokens (Fernet). If empty, tokens are stored plaintext.
+    deriv_token_key: str | None = Field(default=None)
 
     @property
     def database_url(self) -> str:

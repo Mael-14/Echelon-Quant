@@ -130,6 +130,10 @@ services:
       REDIS_HOST: redis
       REDIS_PORT: ${REDIS_PORT:-6379}
       REDIS_DB: ${REDIS_DB:-0}
+      # Optional Deriv credentials for OTP-authenticated websocket (leave empty to use public feed)
+      DERIV_TOKEN: ${DERIV_TOKEN:-}
+      DERIV_ACCOUNT_ID: ${DERIV_ACCOUNT_ID:-}
+      DERIV_APP_ID: ${DERIV_APP_ID:-}
     ports:
       - "8003:8000"
     depends_on:
