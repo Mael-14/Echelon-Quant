@@ -83,6 +83,15 @@ class DerivClient:
         if not isinstance(response, dict):
             raise DerivClientError("Subscription response was not a JSON object")
 
+        # Deriv reports a rejected subscription (e.g. an unknown symbol) as a normal JSON
+        # object with an "error" field, not a transport-level failure - without this check
+        # a bad symbol looks like a successful subscribe and then silently never ticks.
+        error = response.get("error")
+        if isinstance(error, dict):
+            code = error.get("code", "UnknownError")
+            message = error.get("message", "Deriv rejected the subscription")
+            raise DerivClientError(f"Deriv subscription error [{code}]: {message}")
+
         return response
 
     async def send(self, message: dict[str, Any] | str) -> str:

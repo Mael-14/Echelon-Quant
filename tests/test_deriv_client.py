@@ -84,6 +84,23 @@ async def test_subscribe_sends_payload_and_receives_first_update() -> None:
 
 
 @pytest.mark.asyncio
+async def test_subscribe_raises_on_deriv_error_response() -> None:
+    websocket = FakeWebSocket()
+    websocket.incoming_messages.append(
+        '{"error":{"code":"InvalidSymbol","message":"Symbol V75_2S invalid"},"msg_type":"ticks"}'
+    )
+
+    async def websocket_factory(url: str) -> FakeWebSocket:
+        return websocket
+
+    client = DerivClient(websocket_factory=websocket_factory)
+    await client.connect()
+
+    with pytest.raises(DerivClientError, match="InvalidSymbol"):
+        await client.subscribe({"ticks": "V75_2S"})
+
+
+@pytest.mark.asyncio
 async def test_receive_decodes_json_payloads() -> None:
     websocket = FakeWebSocket()
     websocket.incoming_messages.append('{"ping":"pong"}')

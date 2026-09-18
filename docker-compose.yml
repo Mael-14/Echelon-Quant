@@ -53,6 +53,12 @@ services:
       REDIS_PORT: ${REDIS_PORT:-6379}
       REDIS_DB: ${REDIS_DB:-0}
       BOT_SERVICE_URL: ${BOT_SERVICE_URL:-http://bot-service:8000}
+    # Explicit DNS: Docker-in-Docker's embedded resolver can fail to reach public DNS from
+    # inside a container even when the host resolves fine (seen in GitHub Codespaces) - this
+    # service calls out to Deriv's OAuth/account endpoints, so it needs working DNS.
+    dns:
+      - 8.8.8.8
+      - 1.1.1.1
     ports:
       - "8000:8000"
     depends_on:
@@ -137,6 +143,12 @@ services:
       DERIV_TOKEN: ${DERIV_TOKEN:-}
       DERIV_ACCOUNT_ID: ${DERIV_ACCOUNT_ID:-}
       DERIV_APP_ID: ${DERIV_APP_ID:-}
+    # Explicit DNS: Docker-in-Docker's embedded resolver can fail to reach public DNS from
+    # inside a container even when the host resolves fine (seen in GitHub Codespaces) - this
+    # service opens a live Deriv tick WebSocket, so it needs working DNS.
+    dns:
+      - 8.8.8.8
+      - 1.1.1.1
     ports:
       - "8003:8000"
     depends_on:

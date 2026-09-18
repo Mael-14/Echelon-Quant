@@ -74,8 +74,11 @@ async def unsubscribe(req: UnsubscribeRequest):
 
 @app.on_event("startup")
 async def startup_event() -> None:
-    # Start market data pipeline in background
-    symbols = ["XAUUSD", "V75_2S"]
+    # Start market data pipeline in background.
+    # Deriv symbol codes - not free-form strings: forex/commodities are prefixed "frx"
+    # (frxXAUUSD = Gold/USD), and volatility indices are R_<n> (R_75 = Volatility 75 Index).
+    # See docs/deriv-api.md / Deriv's `active_symbols` call for the full catalogue.
+    symbols = ["frxXAUUSD", "R_75"]
     pipeline = MarketDataPipeline(settings=settings, symbols=symbols)
     task: Any = asyncio.create_task(pipeline.run(), name="market-data-pipeline")
     app.state._market_data_pipeline_task = task
