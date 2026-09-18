@@ -73,6 +73,7 @@ jobs:
         run: |
           set -euo pipefail
           python -m mypy backend/shared --ignore-missing-imports --explicit-package-bases
+          python -m mypy backend/alembic --ignore-missing-imports --explicit-package-bases
           while IFS= read -r app_dir; do
             echo "Type-checking ${app_dir}"
             python -m mypy "${app_dir}" --ignore-missing-imports --explicit-package-bases

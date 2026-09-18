@@ -27,25 +27,14 @@ class FakePipeline:
         self._tasks.pop(key, None)
 
 
-@pytest.fixture(autouse=True)
-def stub_pipeline(monkeypatch):
-    # Replace the real pipeline with a fake before the app startup runs.
+def _import_market_data_service_main(*, purge_cache: bool):
     # The service directory name contains a hyphen and isn't importable as a normal package,
-    # so add the service folder to sys.path and import `app.main` from there.
-    import sys
-    from pathlib import Path
-
-    repo_root = Path(__file__).resolve().parents[1]
-    service_dir = repo_root / "backend" / "services" / "market-data-service"
-    sys.path.insert(0, str(service_dir))
-    import app.main as main_mod
-
-    monkeypatch.setattr(main_mod, "MarketDataPipeline", FakePipeline)
-    yield
-
-
-def test_subscribe_unsubscribe_endpoints():
-    # Import the service `app` by inserting the service directory into sys.path
+    # so add the service folder to sys.path and import `app.main` from there. Other test
+    # modules (e.g. bot-service) also expose an `app` package under a different directory;
+    # since module imports are cached by name in sys.modules regardless of sys.path order,
+    # purge any cached `app`/`app.*` modules once per test to avoid picking up the wrong
+    # service - but only on the *first* import of the test, so the module we patch below
+    # is the same one the test later runs against.
     import sys
     from pathlib import Path
     import importlib
@@ -53,7 +42,28 @@ def test_subscribe_unsubscribe_endpoints():
     repo_root = Path(__file__).resolve().parents[1]
     service_dir = repo_root / "backend" / "services" / "market-data-service"
     sys.path.insert(0, str(service_dir))
-    main_mod = importlib.import_module("app.main")
+
+    if purge_cache:
+        for module_name in list(sys.modules):
+            if module_name == "app" or module_name.startswith("app."):
+                del sys.modules[module_name]
+
+    return importlib.import_module("app.main")
+
+
+@pytest.fixture(autouse=True)
+def stub_pipeline(monkeypatch):
+    # Replace the real pipeline with a fake before the app startup runs.
+    main_mod = _import_market_data_service_main(purge_cache=True)
+
+    monkeypatch.setattr(main_mod, "MarketDataPipeline", FakePipeline)
+    yield
+
+
+def test_subscribe_unsubscribe_endpoints():
+    # Reuse the module the `stub_pipeline` fixture already imported and patched -
+    # purging the cache again here would re-run app.main fresh and lose the patch.
+    main_mod = _import_market_data_service_main(purge_cache=False)
     app = main_mod.app
 
     with TestClient(app) as client:

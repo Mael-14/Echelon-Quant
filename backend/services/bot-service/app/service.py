@@ -63,6 +63,10 @@ class BotManager:
     def get_bot(self, bot_id: str) -> BotRecord | None:
         return self._bots.get(bot_id)
 
+    def load_bot(self, record: BotRecord) -> None:
+        """Hydrate a bot from persisted state without validating a state transition."""
+        self._bots[record.config.bot_id] = record
+
     def update_bot(self, bot_id: str, config: BotConfig) -> BotRecord:
         current = self._bots.get(bot_id)
         if current is None:

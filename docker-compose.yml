@@ -52,6 +52,7 @@ services:
       REDIS_HOST: redis
       REDIS_PORT: ${REDIS_PORT:-6379}
       REDIS_DB: ${REDIS_DB:-0}
+      BOT_SERVICE_URL: ${BOT_SERVICE_URL:-http://bot-service:8000}
     ports:
       - "8000:8000"
     depends_on:
@@ -59,6 +60,8 @@ services:
         condition: service_healthy
       redis:
         condition: service_healthy
+      bot-service:
+        condition: service_started
 
   account-service:
     build:
@@ -141,6 +144,27 @@ services:
         condition: service_healthy
       redis:
         condition: service_healthy
+
+  # One-off migration runner: `docker compose --profile tools run --rm migrate`.
+  # Run this against a fresh database before starting the app services above -
+  # they no longer create their own tables at startup (see backend/alembic/).
+  migrate:
+    build:
+      context: .
+      dockerfile: backend/apps/api-gateway/Dockerfile
+    container_name: echelon-migrate
+    working_dir: /app
+    command: ["python", "-m", "alembic", "upgrade", "head"]
+    environment:
+      POSTGRES_HOST: postgres
+      POSTGRES_PORT: ${POSTGRES_PORT:-5432}
+      POSTGRES_DB: ${POSTGRES_DB:-echelon_quant}
+      POSTGRES_USER: ${POSTGRES_USER:-postgres}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-postgres}
+    depends_on:
+      postgres:
+        condition: service_healthy
+    profiles: ["tools"]
 
 volumes:
   postgres_data:

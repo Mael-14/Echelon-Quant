@@ -9,12 +9,14 @@ from pydantic import BaseModel
 
 from backend.shared.config import get_settings
 from backend.shared.health import build_health_response
+from backend.shared.observability import configure_logging, metrics_response
 
 from .pipeline import MarketDataPipeline
 
 log = logging.getLogger("market-data-service")
 
 settings = get_settings()
+configure_logging("market-data-service")
 app = FastAPI(title="Market Data Service", version="0.1.0", debug=settings.debug)
 
 
@@ -35,6 +37,11 @@ class UnsubscribeRequest(BaseModel):
 @app.get("/health")
 async def health():
     return build_health_response("market-data-service", settings.environment)
+
+
+@app.get("/metrics")
+async def metrics():
+    return metrics_response()
 
 
 @app.post("/api/v1/market/subscribe")

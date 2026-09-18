@@ -1,6 +1,5 @@
-from datetime import datetime, timezone
-
 from fastapi import FastAPI, HTTPException, Path, status
+from fastapi.responses import JSONResponse
 from pydantic import BaseModel
 
 import asyncio
@@ -10,76 +9,55 @@ from urllib.error import HTTPError, URLError
 import json
 
 import asyncpg
-from cryptography.fernet import Fernet, InvalidToken
+import httpx
 
 from backend.shared.config import get_settings
 from backend.shared.health import build_health_response
-from backend.shared.schemas import BotConfig, BotLifecycleState, BotStatus
+from backend.shared.observability import configure_logging, metrics_response
+from backend.shared.schemas import BotConfig
+from backend.shared.token_crypto import TokenDecryptionError, decrypt_token, encrypt_token
 
 settings = get_settings()
+configure_logging("api-gateway")
 app = FastAPI(title=settings.app_name, version="0.1.0", debug=settings.debug)
+
+_db_pool_lock = asyncio.Lock()
 
 
 async def _ensure_db_pool() -> asyncpg.Pool:
+    # Schema (the `deriv_tokens` table) is managed by Alembic migrations
+    # (backend/alembic/versions/0001_initial_schema.py) - run `alembic upgrade head`
+    # before starting this service. Unlike market-data-service/bot-service, a failed
+    # connection here is allowed to raise: token storage has no degraded fallback mode.
     pool: asyncpg.Pool | None = getattr(app.state, "pg_pool", None)
-    if pool is None:
-        dsn = settings.database_url.replace("+asyncpg", "")
-        pool = await asyncpg.create_pool(dsn)
-        app.state.pg_pool = pool
+    if pool is not None:
+        return pool
+    async with _db_pool_lock:
+        pool = getattr(app.state, "pg_pool", None)
+        if pool is None:
+            dsn = settings.database_url.replace("+asyncpg", "")
+            pool = await asyncpg.create_pool(dsn)
+            app.state.pg_pool = pool
     return pool
 
 
-async def _create_deriv_tokens_table() -> None:
-    pool = await _ensure_db_pool()
-    async with pool.acquire() as conn:
-        await conn.execute(
-            """
-            CREATE TABLE IF NOT EXISTS deriv_tokens (
-                user_id TEXT PRIMARY KEY,
-                token TEXT NOT NULL,
-                account_id TEXT,
-                app_id INTEGER,
-                created_at TIMESTAMPTZ DEFAULT now()
-            )
-            """
-        )
+def _ensure_bot_service_client() -> httpx.AsyncClient:
+    client: httpx.AsyncClient | None = getattr(app.state, "bot_service_client", None)
+    if client is None:
+        client = httpx.AsyncClient(base_url=settings.bot_service_url, timeout=10.0)
+        app.state.bot_service_client = client
+    return client
 
 
-def _get_fernet() -> Fernet | None:
-    key = settings.deriv_token_key
-    if not key:
-        return None
+async def _proxy_bot_request(method: str, path: str, *, json_body: Any = None) -> JSONResponse:
+    client = _ensure_bot_service_client()
     try:
-        return Fernet(key.encode("utf-8") if isinstance(key, str) else key)
-    except Exception:
-        return None
-
-
-def _encrypt_token(plain: str) -> str:
-    f = _get_fernet()
-    if f is None:
-        return plain
-    return f.encrypt(plain.encode("utf-8")).decode("utf-8")
-
-
-def _decrypt_token(enc: str) -> str:
-    f = _get_fernet()
-    if f is None:
-        return enc
-    try:
-        return f.decrypt(enc.encode("utf-8")).decode("utf-8")
-    except InvalidToken:
-        # If decryption fails, return as-is to avoid blocking; caller should handle failures.
-        return enc
-
-
-@app.on_event("startup")
-async def _startup_db() -> None:
-    try:
-        await _create_deriv_tokens_table()
-    except Exception:
-        # DB might be unavailable in dev; fail loudly would crash service.
-        pass
+        resp = await client.request(method, path, json=json_body)
+    except httpx.HTTPError as exc:
+        raise HTTPException(
+            status_code=status.HTTP_502_BAD_GATEWAY, detail="bot-service unavailable"
+        ) from exc
+    return JSONResponse(status_code=resp.status_code, content=resp.json())
 
 
 @app.on_event("shutdown")
@@ -89,17 +67,21 @@ async def _shutdown_db() -> None:
         await pool.close()
 
 
-class BotState(BaseModel):
-    config: BotConfig
-    status: BotStatus
-
-
-bots_store: dict[str, BotState] = {}
+@app.on_event("shutdown")
+async def _shutdown_bot_service_client() -> None:
+    client: httpx.AsyncClient | None = getattr(app.state, "bot_service_client", None)
+    if client is not None:
+        await client.aclose()
 
 
 @app.get("/health")
 async def health():
     return build_health_response("api-gateway", settings.environment)
+
+
+@app.get("/metrics")
+async def metrics():
+    return metrics_response()
 
 
 class DerivTokenIn(BaseModel):
@@ -112,7 +94,7 @@ class DerivTokenIn(BaseModel):
 @app.post("/api/v1/deriv/token", status_code=status.HTTP_201_CREATED)
 async def store_deriv_token(payload: DerivTokenIn) -> dict:
     pool = await _ensure_db_pool()
-    enc = _encrypt_token(payload.token)
+    enc = encrypt_token(payload.token, settings=settings)
     async with pool.acquire() as conn:
         await conn.execute(
             "INSERT INTO deriv_tokens(user_id, token, account_id, app_id) VALUES($1,$2,$3,$4) "
@@ -133,9 +115,13 @@ async def list_deriv_accounts(user_id: str = Path(min_length=1)) -> Any:
     if not row:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="No token for user")
 
-    token = row["token"]
-    # decrypt if encrypted
-    token = _decrypt_token(token)
+    try:
+        token = decrypt_token(row["token"], settings=settings)
+    except TokenDecryptionError as exc:
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail="Stored Deriv token could not be decrypted; please re-authenticate",
+        ) from exc
 
     def _fetch_accounts() -> Any:
         endpoint = "https://api.derivws.com/trading/v1/options/accounts"
@@ -197,7 +183,7 @@ async def deriv_oauth_exchange(payload: OAuthExchangeIn) -> dict:
 
     # store token for user
     pool = await _ensure_db_pool()
-    enc = _encrypt_token(access_token)
+    enc = encrypt_token(access_token, settings=settings)
     async with pool.acquire() as conn:
         await conn.execute(
             "INSERT INTO deriv_tokens(user_id, token) VALUES($1,$2) ON CONFLICT(user_id) DO UPDATE SET token=EXCLUDED.token, created_at=now()",
@@ -208,97 +194,42 @@ async def deriv_oauth_exchange(payload: OAuthExchangeIn) -> dict:
     return {"status": "ok"}
 
 
-@app.get("/api/v1/bots", response_model=list[BotState])
-async def list_bots() -> list[BotState]:
-    return list(bots_store.values())
+# Bot lifecycle is owned by bot-service (BotManager's state machine); api-gateway is a
+# thin proxy so there's a single source of truth for bot state.
+@app.get("/api/v1/bots")
+async def list_bots() -> JSONResponse:
+    return await _proxy_bot_request("GET", "/api/v1/bots")
 
 
-@app.post("/api/v1/bots", response_model=BotState, status_code=status.HTTP_201_CREATED)
-async def create_bot(bot_config: BotConfig) -> BotState:
-    if bot_config.bot_id in bots_store:
-        raise HTTPException(
-            status_code=status.HTTP_409_CONFLICT,
-            detail=f"Bot '{bot_config.bot_id}' already exists",
-        )
-
-    bot_state = BotState(
-        config=bot_config,
-        status=BotStatus(
-            bot_id=bot_config.bot_id,
-            state=BotLifecycleState.CREATED,
-            uptime_seconds=0,
-        ),
+@app.post("/api/v1/bots")
+async def create_bot(bot_config: BotConfig) -> JSONResponse:
+    return await _proxy_bot_request(
+        "POST", "/api/v1/bots", json_body=bot_config.model_dump(mode="json")
     )
-    bots_store[bot_config.bot_id] = bot_state
-    return bot_state
 
 
-@app.get("/api/v1/bots/{id}", response_model=BotState)
-async def get_bot(id: str = Path(min_length=1)) -> BotState:
-    bot_state = bots_store.get(id)
-    if bot_state is None:
-        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=f"Bot '{id}' not found")
-    return bot_state
+@app.get("/api/v1/bots/{id}")
+async def get_bot(id: str = Path(min_length=1)) -> JSONResponse:
+    return await _proxy_bot_request("GET", f"/api/v1/bots/{id}")
 
 
-@app.put("/api/v1/bots/{id}", response_model=BotState)
-async def update_bot(bot_config: BotConfig, id: str = Path(min_length=1)) -> BotState:
-    existing = bots_store.get(id)
-    if existing is None:
-        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=f"Bot '{id}' not found")
-    if bot_config.bot_id != id:
-        raise HTTPException(
-            status_code=status.HTTP_400_BAD_REQUEST,
-            detail="Path id must match body bot_id",
-        )
-
-    updated_status = existing.status.model_copy(update={"last_heartbeat": datetime.now(timezone.utc)})
-    updated = BotState(config=bot_config, status=updated_status)
-    bots_store[id] = updated
-    return updated
-
-
-@app.post("/api/v1/bots/{id}/start", response_model=BotStatus)
-async def start_bot(id: str = Path(min_length=1)) -> BotStatus:
-    bot_state = bots_store.get(id)
-    if bot_state is None:
-        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=f"Bot '{id}' not found")
-
-    bot_state.status = bot_state.status.model_copy(
-        update={
-            "state": BotLifecycleState.RUNNING,
-            "error": None,
-            "last_heartbeat": datetime.now(timezone.utc),
-        }
+@app.put("/api/v1/bots/{id}")
+async def update_bot(bot_config: BotConfig, id: str = Path(min_length=1)) -> JSONResponse:
+    return await _proxy_bot_request(
+        "PUT", f"/api/v1/bots/{id}", json_body=bot_config.model_dump(mode="json")
     )
-    return bot_state.status
 
 
-@app.post("/api/v1/bots/{id}/stop", response_model=BotStatus)
-async def stop_bot(id: str = Path(min_length=1)) -> BotStatus:
-    bot_state = bots_store.get(id)
-    if bot_state is None:
-        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=f"Bot '{id}' not found")
-
-    bot_state.status = bot_state.status.model_copy(
-        update={
-            "state": BotLifecycleState.STOPPED,
-            "last_heartbeat": datetime.now(timezone.utc),
-        }
-    )
-    return bot_state.status
+@app.post("/api/v1/bots/{id}/start")
+async def start_bot(id: str = Path(min_length=1)) -> JSONResponse:
+    return await _proxy_bot_request("POST", f"/api/v1/bots/{id}/start")
 
 
-@app.post("/api/v1/bots/{id}/pause", response_model=BotStatus)
-async def pause_bot(id: str = Path(min_length=1)) -> BotStatus:
-    bot_state = bots_store.get(id)
-    if bot_state is None:
-        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=f"Bot '{id}' not found")
+@app.post("/api/v1/bots/{id}/stop")
+async def stop_bot(id: str = Path(min_length=1)) -> JSONResponse:
+    return await _proxy_bot_request("POST", f"/api/v1/bots/{id}/stop")
 
-    bot_state.status = bot_state.status.model_copy(
-        update={
-            "state": BotLifecycleState.PAUSED,
-            "last_heartbeat": datetime.now(timezone.utc),
-        }
-    )
-    return bot_state.status
+
+@app.post("/api/v1/bots/{id}/pause")
+async def pause_bot(id: str = Path(min_length=1)) -> JSONResponse:
+    return await _proxy_bot_request("POST", f"/api/v1/bots/{id}/pause")
