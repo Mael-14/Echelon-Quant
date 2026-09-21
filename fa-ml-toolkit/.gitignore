@@ -1,0 +1,10 @@
+__pycache__/
+*.pyc
+.venv/
+.pytest_cache/
+*.npz
+# Broker history is large and regenerable; deriv_history.json is kept as a
+# sample so the scripts run out of the box.
+data/*.json
+!data/deriv_history.json
+data/*.csv
