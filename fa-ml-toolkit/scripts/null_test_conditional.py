@@ -20,14 +20,21 @@ to test *this* setup, on its own terms.
 
 **What the verdict has to clear.** Landing above the martingale line is not
 enough. Cost is a fixed subtraction, so the bar is the breakeven probability
-``(1 + cost) / (1 + b)``, and the gap between those two lines is small at a
-slow frame -- 0.017/(1+b), under a point. A test that cannot resolve a gap
-that narrow cannot return a meaningful negative, so the report prints the
-minimum detectable effect beside every measurement. Read that column first.
+``(1 + cost) / (1 + b)``, and the gap between those two lines is set entirely
+by the execution frame. At H4 it is 0.017/(1+b), under a point, and a test that
+cannot resolve a gap that narrow cannot return a meaningful negative -- so the
+report prints the minimum detectable effect beside every measurement, and that
+column is the one to read first.
+
+At M1 the problem inverts. The gap is 0.212/(1+b), over ten points, so the test
+has no trouble resolving it -- but a setup now has to beat the martingale by
+ten points to pay for itself, and ADR-004 found deviations of -0.010 to +0.003.
+The cost defaults per ``--micro`` for exactly this reason: measuring an M1 run
+against H4's hurdle would turn a hopeless cell into a promising one.
 
 Usage:
 
-    python scripts/null_test_conditional.py --history data/mt5_history.json
+    python scripts/null_test_conditional.py --history data/deriv_history.json --macro 4h --micro 1m
 
 """
 from __future__ import annotations
@@ -35,17 +42,14 @@ from __future__ import annotations
 import argparse
 import bisect
 import json
-import sys
 from datetime import datetime, timedelta, timezone
 from math import sqrt
 from pathlib import Path
 
-sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
-
-from forex_agent.models import Bar, Timeframe  # noqa: E402
-from forex_agent.strategy.barriers import martingale_probability, resolve  # noqa: E402
-from forex_agent.strategy.expectancy import breakeven_probability  # noqa: E402
-from forex_agent.strategy.features import FEATURE_COLUMNS, encode_features  # noqa: E402
+from forex_agent.models import Bar, Timeframe
+from forex_agent.strategy.barriers import martingale_probability, resolve
+from forex_agent.strategy.expectancy import breakeven_probability
+from forex_agent.strategy.features import FEATURE_COLUMNS, encode_features
 
 #: Trailing macro bars handed to the encoder. The EMA200 seed decays by
 #: ``(1 - 2/201)**600 ~= 0.003``, so 600 reproduces the full-history baseline
@@ -55,11 +59,34 @@ MACRO_WINDOW = 600
 #: Trailing micro bars. This must cover a whole UTC session at the execution
 #: frame or the VWAP anchor is silently truncated: a day is 288 M5 bars, and a
 #: 200-bar window would cut the morning off every afternoon reading.
+#:
+#: Which is why it is a floor rather than the value: a day is 1440 M1 bars, so
+#: a fixed 400 would cut off exactly what this comment warns about as soon as
+#: the execution frame drops below M5. :func:`micro_window_for` applies it.
 MICRO_WINDOW = 400
+
+
+def micro_window_for(frame: Timeframe) -> int:
+    """Micro bars to keep: one whole UTC session, never fewer than 400."""
+    return max(MICRO_WINDOW, 86_400 // frame.seconds)
+
 
 #: Deviations are scanned across many cells, so the single-test 1.96 would
 #: manufacture hits. Roughly Bonferroni for ~50 cells at 0.05.
 SIGNIFICANCE_Z = 3.3
+
+#: Spread drag in R per execution frame, from ADR-004. This sets the breakeven
+#: line every deviation below is measured against, so it cannot be a constant:
+#: pinned at H4's 0.017 an M1 run understates its own hurdle by over 12x, which
+#: is the difference between "nothing here" and "worth building a model".
+#: M1 is extrapolated from M5 by the 1/sqrt(time) law, not measured.
+SPREAD_DRAG_R = {
+    Timeframe.M1: 0.095 * sqrt(300 / 60),
+    Timeframe.M5: 0.095,
+    Timeframe.M15: 0.045,
+    Timeframe.H4: 0.017,
+    Timeframe.D1: 0.007,
+}
 
 
 # --------------------------------------------------------------------- data
@@ -205,15 +232,17 @@ def collect(history: dict, macro: Timeframe, micro: Timeframe, args) -> list[dic
     for symbol, frames in sorted(history.items()):
         if args.symbols and symbol not in args.symbols:
             continue
+        micro_window = micro_window_for(micro)
         macro_bars = load_bars(symbol, frames.get(macro.value) or [], macro)
         micro_bars = load_bars(symbol, frames.get(micro.value) or [], micro)
-        if len(macro_bars) < MACRO_WINDOW or len(micro_bars) < MICRO_WINDOW:
-            print(f"  {symbol}: skipped, {len(macro_bars)} macro / {len(micro_bars)} micro bars")
+        if len(macro_bars) < MACRO_WINDOW or len(micro_bars) < micro_window:
+            print(f"  {symbol}: skipped, {len(macro_bars)}/{MACRO_WINDOW} macro "
+                  f"and {len(micro_bars)}/{micro_window} micro bars")
             continue
 
         macro_ends = [bar.end for bar in macro_bars]
         encoded = skipped = 0
-        start = max(MICRO_WINDOW, args.stride)
+        start = max(micro_window, args.stride)
         for index in range(start, len(micro_bars) - 1, args.stride):
             now = micro_bars[index].end
             # Only macro bars that have already closed. The macro bar
@@ -224,13 +253,13 @@ def collect(history: dict, macro: Timeframe, micro: Timeframe, args) -> list[dic
                 continue
             features = encode_features(
                 macro_bars[max(0, cut - MACRO_WINDOW) : cut],
-                micro_bars[max(0, index + 1 - MICRO_WINDOW) : index + 1],
+                micro_bars[max(0, index + 1 - micro_window) : index + 1],
             )
             if features is None:
                 skipped += 1
                 continue
             row = dict(zip(FEATURE_COLUMNS, features.as_row()))
-            atr = _atr_at(micro_bars, index, args.atr_length)
+            atr = _atr_at(micro_bars, index, args.atr_length, micro_window)
             if atr <= 0:
                 skipped += 1
                 continue
@@ -251,10 +280,10 @@ def collect(history: dict, macro: Timeframe, micro: Timeframe, args) -> list[dic
     return samples
 
 
-def _atr_at(bars: list[Bar], index: int, length: int) -> float:
+def _atr_at(bars: list[Bar], index: int, length: int, window: int) -> float:
     from forex_agent.strategy.indicators import true_range_atr
 
-    return true_range_atr(bars[max(0, index + 1 - MICRO_WINDOW) : index + 1], length)
+    return true_range_atr(bars[max(0, index + 1 - window) : index + 1], length)
 
 
 # -------------------------------------------------------------------- reports
@@ -267,29 +296,41 @@ def quintile_edges(values: list[float], buckets: int) -> list[float]:
 
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--history", type=Path, default=Path("data/mt5_history.json"))
+    parser.add_argument("--history", type=Path, default=Path("data/deriv_history.json"))
     parser.add_argument("--symbols", nargs="+", default=None,
                         help="restrict to these symbols; default is every symbol in the file")
-    parser.add_argument("--macro", default="1d", help="structural frame (default 1d)")
-    parser.add_argument("--micro", default="4h", help="execution frame (default 4h)")
+    parser.add_argument("--macro", default="4h", help="structural frame (default 4h)")
+    parser.add_argument("--micro", default="1m", help="execution frame (default 1m)")
     parser.add_argument("--stride", type=int, default=12, help="micro bars between samples")
     parser.add_argument("--reward", type=float, nargs="+", default=[1.0, 2.0])
     parser.add_argument("--stop-atr", type=float, default=1.5)
     parser.add_argument("--atr-length", type=int, default=14)
     parser.add_argument("--max-hold", type=int, default=120)
     parser.add_argument(
-        "--cost", type=float, default=0.017,
-        help="spread drag in R at this frame; ADR-004 measures 0.017 at H4",
+        "--cost", type=float, default=None,
+        help="spread drag in R at the execution frame; defaults from the "
+             "ADR-004 table (0.017 at H4, 0.095 at M5; 1m is extrapolated)",
     )
     parser.add_argument("--buckets", type=int, default=5)
     args = parser.parse_args()
 
     macro, micro = Timeframe(args.macro), Timeframe(args.micro)
+    if macro.seconds <= micro.seconds:
+        raise SystemExit(
+            f"--macro ({macro.value}) must be coarser than --micro ({micro.value})"
+        )
+    if args.cost is None:
+        if micro not in SPREAD_DRAG_R:
+            raise SystemExit(
+                f"no spread drag on record for {micro.value}; pass --cost explicitly"
+            )
+        args.cost = SPREAD_DRAG_R[micro]
     history = json.loads(args.history.read_text())
 
+    measured = " (EXTRAPOLATED)" if micro is Timeframe.M1 else ""
     print(f"Conditional null test: {macro.value} structure / {micro.value} execution")
     print(f"stop {args.stop_atr}xATR({args.atr_length}), max hold {args.max_hold} bars, "
-          f"stride {args.stride}, cost {args.cost}R")
+          f"stride {args.stride}, cost {args.cost:.4f}R{measured}")
     print()
     samples = collect(history, macro, micro, args)
     if not samples:

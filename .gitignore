@@ -1,1 +1,21 @@
 .env
+
+# Build metadata from `pip install -e ./fa-ml-toolkit`.
+*.egg-info/
+
+# Compiled bytecode. These were tracked until now, which meant every test run
+# dirtied the working tree and swept machine-specific .pyc files into commits.
+__pycache__/
+*.py[cod]
+
+# Tool caches.
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+
+# Local virtualenvs.
+.venv/
+venv/
+
+# Trained models are regenerable and are not committed (see ADR-004).
+artifacts/*.joblib

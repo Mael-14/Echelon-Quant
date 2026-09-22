@@ -3,6 +3,6 @@
 from .deriv_client import DerivClient, DerivClientError
 
 __all__ = [
-	"DerivClient",
-	"DerivClientError",
+    "DerivClient",
+    "DerivClientError",
 ]

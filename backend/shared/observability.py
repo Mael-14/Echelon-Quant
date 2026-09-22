@@ -63,3 +63,47 @@ MARKET_DATA_ACTIVE_SUBSCRIPTIONS = Gauge(
     "market_data_active_subscriptions",
     "Current number of active bot subscriptions to market data",
 )
+
+# analysis-service. Here for the same reason as the counters above: the service
+# module is purged and re-imported by tests, and re-running a Counter(...) call
+# against the global REGISTRY raises "Duplicated timeseries".
+ANALYSIS_SIGNALS_EMITTED = Counter(
+    "analysis_signals_emitted_total",
+    "Signals that cleared the cost gate and were published",
+    ["symbol", "side"],
+)
+ANALYSIS_SIGNALS_REJECTED = Counter(
+    "analysis_signals_rejected_total",
+    "Setups the cost gate refused, by reason",
+    ["symbol", "reason"],
+)
+ANALYSIS_MODEL_LOADED = Gauge(
+    "analysis_model_loaded",
+    "1 when a usable model artifact is loaded, 0 when the service is degraded",
+)
+ANALYSIS_LAST_SIGNAL_PROBABILITY = Gauge(
+    "analysis_last_signal_probability",
+    "Model win probability for the most recent evaluated setup",
+    ["symbol"],
+)
+
+# execution-service.
+EXECUTION_ORDERS_PLACED = Counter(
+    "execution_orders_placed_total",
+    "Multiplier contracts bought",
+    ["symbol", "contract_type"],
+)
+EXECUTION_ORDERS_REFUSED = Counter(
+    "execution_orders_refused_total",
+    "Signals that reached execution but were not traded, by reason",
+    ["symbol", "reason"],
+)
+EXECUTION_OPEN_POSITIONS = Gauge(
+    "execution_open_positions",
+    "Contracts currently open",
+)
+EXECUTION_REALISED_R = Counter(
+    "execution_realised_r_total",
+    "Cumulative realised R, shifted positive so a counter can carry it",
+    ["symbol"],
+)

@@ -1,10 +1,23 @@
 # Core. The feature encoder, barriers and expectancy need only these.
-numpy>=1.23,<2.0
+#
+# The numpy<2.0 cap that shipped with this toolkit was conservative rather than
+# load-bearing: no numpy-1.x-only API (np.float_, np.NaN, np.product, ...) is
+# used anywhere here, and the cap has no CPython 3.14 wheels.
+numpy>=1.26
 scikit-learn>=1.3
+
+# Model persistence. The trainer saves {model, scaler, metadata} so a service
+# can load it; without this the fitted estimator is discarded on return.
+joblib>=1.3
 
 # Only scripts/search_combinations.py imports this, and it imports it lazily,
 # so everything else runs without it.
 xgboost>=2.0
+
+# scripts/download_deriv_training_data.py imports both at module top level.
+# Both are already pinned in backend/requirements/base.txt.
+httpx>=0.27.0
+websockets>=12.0
 
 # Optional. indicators.py prefers pandas-ta and falls back to pure-Python
 # implementations when either is missing -- results are equivalent for ATR,
@@ -12,10 +25,11 @@ xgboost>=2.0
 # pandas>=2.0,<3.0
 # pandas-ta>=0.3.14b
 
-# Only the downloaders need these.
-# MetaTrader5>=5.0.45 ; platform_system == "Windows"   # scripts/download_mt5_training_data.py
-# websockets>=12.0                                      # scripts/download_deriv_training_data.py
-# httpx>=0.27.0                                         # scripts/download_deriv_training_data.py
-# python-dotenv>=1.0.1                                  # forex_agent/config.py reads .env
+# Only scripts/download_mt5_training_data.py needs this, and it is a Windows-only
+# binary wheel driving a desktop terminal over local IPC.
+# MetaTrader5>=5.0.45 ; platform_system == "Windows"
+
+# forex_agent/config.py reads .env when this is present, and no-ops without it.
+# python-dotenv>=1.0.1
 
 pytest>=8.0

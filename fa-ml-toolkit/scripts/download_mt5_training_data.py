@@ -32,13 +32,10 @@ from __future__ import annotations
 
 import argparse
 import csv
-import sys
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
-sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
-
-from forex_agent.config import MT5_FOREX_MARKETS, settings  # noqa: E402
+from forex_agent.config import MT5_FOREX_MARKETS, settings
 
 #: Frame name -> the attribute holding MetaTrader's timeframe constant. Named
 #: rather than numeric because the values are an implementation detail of the

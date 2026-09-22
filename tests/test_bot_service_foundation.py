@@ -9,7 +9,6 @@ from fastapi.testclient import TestClient
 
 from backend.shared.schemas import BotConfig, BotLifecycleState
 
-
 BOT_SERVICE_ROOT = Path(__file__).resolve().parents[1] / "backend" / "services" / "bot-service"
 
 

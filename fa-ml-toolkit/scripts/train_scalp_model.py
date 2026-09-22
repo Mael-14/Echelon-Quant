@@ -1,20 +1,31 @@
-"""Point-in-time multi-timeframe scalp model: D1 bias, H4 refinement, M5 trigger.
+"""Point-in-time multi-timeframe scalp model: macro analysis, micro trigger.
 
-The cascade is enforced by construction rather than by convention. At each M5
-bar the pipeline takes the most recent D1 and H4 bars **that have already
-closed**, so a daily feature can only change once a day and a 4-hour feature
-once every four hours -- which is exactly what "check D1 daily, H4 every four
-hours" means once it is written down. The bar still forming is never visible:
-its high and low are tomorrow's information, and reading them is the
-look-ahead that makes a backtest lie.
+The cascade is a pair of flags. ``--macro-frames`` are the analysis frames and
+``--exec-frame`` is the one the trade is triggered and resolved on; the default
+is H4 analysis into an M1 trigger. Every macro frame must be strictly coarser
+than the execution frame, which the encoder requires and ``main`` checks.
+
+The cascade is enforced by construction rather than by convention. At each
+execution bar the pipeline takes the most recent macro bars **that have already
+closed**, so a 4-hour feature can only change once every four hours -- which is
+exactly what "check H4 every four hours" means once it is written down. The bar
+still forming is never visible: its high and low are tomorrow's information, and
+reading them is the look-ahead that makes a backtest lie.
+
+Read the cost line the run prints before reading its scores. Cost in R is
+``spread / stop_distance`` and ATR grows as the square root of time, so drag
+falls as ``1/sqrt(time)`` -- ADR-004 measures 0.095R at M5 against 0.017R at H4.
+Dropping the execution frame raises that hurdle rather than lowering it, and the
+M1 entry in ``SPREAD_DRAG_R`` is extrapolated from M5 rather than measured.
 
 Labels follow the triple-barrier method with a *structural* stop:
 
-* profit barrier at ``+1.5 x ATR(M5)`` in the direction of the macro trend
-* stop barrier at the invalidation level -- the local M5 swing low for a long,
-  the swing high for a short, not a fixed ATR multiple
-* time barrier at 24 M5 bars (two hours); scalping needs velocity, so an
-  unresolved trade is closed and **labelled a loss**, not discarded
+* profit barrier at ``+1.5 x ATR`` on the execution frame, in the direction of
+  the macro trend
+* stop barrier at the invalidation level -- the local swing low for a long, the
+  swing high for a short, not a fixed ATR multiple
+* time barrier at ``--holds`` execution-frame bars; scalping needs velocity, so
+  an unresolved trade is closed and **labelled a loss**, not discarded
 
 Because the stop is structural, the reward ratio is a property of each sample
 rather than a constant, and so is the cost in R (``spread / stop_distance``).
@@ -27,45 +38,61 @@ model would need opposite coefficients for longs and shorts and could fit
 neither.
 
 The classifier is L1-penalised logistic regression. Lasso is the point: a
-feature that contributes nothing to the M5 outcome has its weight driven to
+feature that contributes nothing to the outcome has its weight driven to
 exactly zero, so the report below says which timeframes earned their place
 instead of assuming they all did.
 
 Usage:
 
-    python scripts/train_scalp_model.py --history data/mt5_history.json
+    python scripts/train_scalp_model.py --history data/deriv_m1.json --macro-frames 4h --exec-frame 1m
 """
 from __future__ import annotations
 
 import argparse
 import bisect
 import json
-import sys
 from datetime import datetime, timedelta, timezone
-from math import exp
+from math import exp, sqrt
 from pathlib import Path
 
 import numpy as np
+import sklearn
+from sklearn.linear_model import LogisticRegression
+from sklearn.metrics import roc_auc_score
+from sklearn.preprocessing import StandardScaler
 
-sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
-
-from sklearn.linear_model import LogisticRegression  # noqa: E402
-from sklearn.metrics import roc_auc_score  # noqa: E402
-from sklearn.preprocessing import StandardScaler  # noqa: E402
-
-from forex_agent.models import Bar, Timeframe  # noqa: E402
-from forex_agent.strategy.barriers import resolve  # noqa: E402
-from forex_agent.strategy.expectancy import (  # noqa: E402
+from forex_agent import artifact
+from forex_agent.models import Bar, Timeframe
+from forex_agent.strategy.barriers import resolve
+from forex_agent.strategy.expectancy import (
     breakeven_probability,
     brier_score,
     calibration_error,
 )
-from forex_agent.strategy.features import encode_features  # noqa: E402
-from forex_agent.strategy.indicators import swing_points, true_range_atr  # noqa: E402
+from forex_agent.strategy.features import encode_features
+from forex_agent.strategy.indicators import swing_points, true_range_atr
 
-D1_WINDOW = 600
-H4_WINDOW = 600
-M5_WINDOW = 400
+#: Defaults for --macro-window and --exec-window. Both were fixed module
+#: constants pinned to a D1/H4 -> M5 cascade; the cascade is a flag now.
+MACRO_WINDOW = 600
+EXEC_WINDOW = 400
+
+
+def default_exec_window(frame: Timeframe) -> int:
+    """Execution bars to keep: at least one whole UTC session.
+
+    ``momentum`` is the close's distance from the session VWAP, and
+    ``features.vwap`` anchors to the newest UTC day *present in the window*. A
+    window shorter than a session does not fail -- it silently re-anchors to a
+    partial day, so the column means something different in the afternoon than
+    it does at midnight.
+
+    A UTC day is 288 M5 bars, so the historical 400 already covered a session at
+    M5 and every coarser frame, and those defaults are unchanged. It is 1440 M1
+    bars, which 400 does not cover -- at M1 this is the difference between a
+    session reading and a six-hour one.
+    """
+    return max(EXEC_WINDOW, 86_400 // frame.seconds)
 
 #: Trade-relative feature names, in matrix column order.
 FEATURES = (
@@ -79,10 +106,55 @@ FEATURES = (
     "momentum",
 )
 
-#: ADR-004 measured M5 spread drag at 0.095R against a 1.5xATR stop, so the
-#: spread itself is about 0.1425 ATR. Structural stops vary in width, so cost
-#: is recomputed per trade from that price rather than reused as a constant.
-SPREAD_ATR = 0.095 * 1.5
+
+def feature_names_v1(macro_frames: tuple[Timeframe, ...]) -> tuple[str, ...]:
+    """:data:`FEATURES` generalised. Grouped by frame, as v1 already was."""
+    return tuple(
+        [
+            name
+            for frame in macro_frames
+            for name in (
+                f"{frame.name.lower()}_trend",
+                f"{frame.name.lower()}_to_stop",
+                f"{frame.name.lower()}_to_target",
+            )
+        ]
+        + ["pullback", "momentum"]
+    )
+
+
+#: Spread drag in R against a 1.5xATR stop, per execution frame.
+#:
+#: Cost in R is spread/stop_distance; the spread is fixed in price while ATR
+#: grows with the square root of time, so drag falls as 1/sqrt(time). ADR-004
+#: calls this the single largest lever on expectancy the toolkit found -- at
+#: M5 a strategy must clear an 18-point handicap over the martingale rate, at
+#: H4 it must clear 0.7.
+#:
+#: M5, M15, H4 and D1 are measured. **M1 is not.** It is extrapolated from M5
+#: by that same law (0.095 * sqrt(300/60)), and the law only reproduces the
+#: measured cells to within about 20% -- it predicts 0.0137R at H4 where the
+#: measurement says 0.017R. Re-measure against a real Deriv spread before
+#: trusting an M1 number, and expect it to be the dominant term: at M1 the
+#: drag is roughly 2.2x M5, the frame the ADR already rejected.
+SPREAD_DRAG_R = {
+    Timeframe.M1: 0.095 * sqrt(300 / 60),
+    Timeframe.M5: 0.095,
+    Timeframe.M15: 0.045,
+    Timeframe.H4: 0.017,
+    Timeframe.D1: 0.007,
+}
+
+#: The stop the drag table was measured against. The --spread-atr flag is
+#: carried in ATR units rather than R, matching backtest_scalp.py, because
+#: cost is recomputed per trade from the stop actually taken.
+STOP_ATR_MULTIPLE = 1.5
+
+
+def default_spread_atr(frame: Timeframe) -> float:
+    """Spread in ATR units for an execution frame, or 0 if it has no entry."""
+    drag = SPREAD_DRAG_R.get(frame)
+    return drag * STOP_ATR_MULTIPLE if drag is not None else 0.0
 
 
 def load_bars(symbol: str, candles: list[dict], timeframe: Timeframe) -> list[Bar]:
@@ -135,27 +207,75 @@ FEATURES_V2 = (
 )
 
 
+def feature_names_v2(macro_frames: tuple[Timeframe, ...]) -> tuple[str, ...]:
+    """:data:`FEATURES_V2` generalised to any number of macro frames.
+
+    Columns are grouped by kind rather than by frame -- every trend, then
+    every proximity, then every signed distance, then the two micro columns --
+    which is the order the fixed twelve-column tuple already used. Given
+    ``(D1, H4)`` this reproduces ``FEATURES_V2`` exactly, and a test pins that
+    so the generalisation cannot silently reorder a trained model's inputs.
+    """
+    tags = [frame.name.lower() for frame in macro_frames]
+    return tuple(
+        [f"{tag}_trend" for tag in tags]
+        + [f"{tag}_{kind}_prox" for tag in tags for kind in ("stop", "tgt")]
+        + [f"{tag}_{kind}_dist" for tag in tags for kind in ("stop", "tgt")]
+        + ["pullback", "momentum"]
+    )
+
+
 def _clip(value: float, low: float, high: float) -> float:
     return max(low, min(high, value))
 
 
-def encode_row_v2(daily, fourh, is_long: bool) -> list[float]:
+def encode_row_v2(macro, is_long: bool) -> list[float]:
+    """One row per trade direction, in :func:`feature_names_v2` order.
+
+    ``macro`` holds one ``MarketFeatures`` per macro frame, coarsest first.
+    The coarsest is the top of the cascade and supplies the two micro columns;
+    the rest contribute their trend, proximity and distance readings.
+    """
     side = 1.0 if is_long else -1.0
-    d1_stop = daily.distance_to_support if is_long else daily.distance_to_resistance
-    d1_tgt = daily.distance_to_resistance if is_long else daily.distance_to_support
-    h4_stop = fourh.distance_to_support if is_long else fourh.distance_to_resistance
-    h4_tgt = fourh.distance_to_resistance if is_long else fourh.distance_to_support
-    pull = daily.retracement_factor if is_long else 1.0 - daily.retracement_factor
     prox = lambda d: exp(-abs(_clip(d, -40.0, 40.0)))  # noqa: E731
-    return [
-        _clip(daily.macro_trend_score * side, -15.0, 15.0),
-        _clip(fourh.macro_trend_score * side, -15.0, 15.0),
-        prox(d1_stop), prox(d1_tgt), prox(h4_stop), prox(h4_tgt),
-        _clip(d1_stop, -20.0, 20.0), _clip(d1_tgt, -20.0, 20.0),
-        _clip(h4_stop, -20.0, 20.0), _clip(h4_tgt, -20.0, 20.0),
+    stops = [f.distance_to_support if is_long else f.distance_to_resistance for f in macro]
+    targets = [f.distance_to_resistance if is_long else f.distance_to_support for f in macro]
+    top = macro[0]
+    pull = top.retracement_factor if is_long else 1.0 - top.retracement_factor
+
+    row = [_clip(f.macro_trend_score * side, -15.0, 15.0) for f in macro]
+    for stop, target in zip(stops, targets):
+        row += [prox(stop), prox(target)]
+    for stop, target in zip(stops, targets):
+        row += [_clip(stop, -20.0, 20.0), _clip(target, -20.0, 20.0)]
+    row += [
         _clip(pull, -1.0, 2.0),
-        _clip(daily.micro_wave_momentum * side, -10.0, 10.0),
+        _clip(top.micro_wave_momentum * side, -10.0, 10.0),
     ]
+    return row
+
+
+def load_cascade(symbol: str, frames: dict, args):
+    """Macro bar lists (coarsest first) plus the execution bars, or ``None``.
+
+    ``None`` means this symbol cannot support the requested cascade. The
+    message names the frame and the shortfall rather than saying "insufficient
+    history", because at M1 that is the failure everyone hits first: a
+    download long enough to fill the execution window is usually still far too
+    short to fill the macro windows behind it.
+    """
+    macro = []
+    for frame in args.macro_frames:
+        bars = load_bars(symbol, frames.get(frame.value) or [], frame)
+        if len(bars) < args.macro_window:
+            print(f"  {symbol}: skipped ({frame.value} has {len(bars)} bars, needs {args.macro_window})")
+            return None
+        macro.append(bars)
+    micro = load_bars(symbol, frames.get(args.exec_frame.value) or [], args.exec_frame)
+    if len(micro) < args.exec_window:
+        print(f"  {symbol}: skipped ({args.exec_frame.value} has {len(micro)} bars, needs {args.exec_window})")
+        return None
+    return macro, micro
 
 
 def build_dataset_v2(history: dict, args) -> dict:
@@ -169,29 +289,28 @@ def build_dataset_v2(history: dict, args) -> dict:
     rejected = {"no_features": 0, "no_swing": 0, "geometry": 0}
 
     for symbol, frames in sorted(history.items()):
-        d1 = load_bars(symbol, frames.get("1d") or [], Timeframe.D1)
-        h4 = load_bars(symbol, frames.get("4h") or [], Timeframe.H4)
-        m5 = load_bars(symbol, frames.get("5m") or [], Timeframe.M5)
-        if len(d1) < D1_WINDOW or len(h4) < H4_WINDOW or len(m5) < M5_WINDOW:
-            print(f"  {symbol}: skipped (insufficient history)")
+        loaded = load_cascade(symbol, frames, args)
+        if loaded is None:
             continue
-        d1_ends = [bar.end for bar in d1]
-        h4_ends = [bar.end for bar in h4]
+        macro_bars, exec_bars = loaded
+        macro_ends = [[bar.end for bar in bars] for bars in macro_bars]
 
         kept = 0
-        for index in range(M5_WINDOW, len(m5) - max(args.holds) - 1, args.stride):
-            now = m5[index].end
-            d1_cut = bisect.bisect_right(d1_ends, now)
-            h4_cut = bisect.bisect_right(h4_ends, now)
-            if d1_cut < D1_WINDOW or h4_cut < H4_WINDOW:
+        for index in range(args.exec_window, len(exec_bars) - max(args.holds) - 1, args.stride):
+            now = exec_bars[index].end
+            # Point-in-time: only bars already closed at this instant.
+            cuts = [bisect.bisect_right(ends, now) for ends in macro_ends]
+            if any(cut < args.macro_window for cut in cuts):
                 continue
-            micro = m5[index + 1 - M5_WINDOW : index + 1]
-            daily = encode_features(d1[d1_cut - D1_WINDOW : d1_cut], micro)
-            fourh = encode_features(h4[h4_cut - H4_WINDOW : h4_cut], micro)
-            if daily is None or fourh is None:
+            micro = exec_bars[index + 1 - args.exec_window : index + 1]
+            macro = [
+                encode_features(bars[cut - args.macro_window : cut], micro)
+                for bars, cut in zip(macro_bars, cuts)
+            ]
+            if any(f is None for f in macro):
                 rejected["no_features"] += 1
                 continue
-            entry = m5[index].close
+            entry = exec_bars[index].close
             atr = true_range_atr(micro, args.atr_length)
             if atr <= 0:
                 rejected["geometry"] += 1
@@ -213,13 +332,13 @@ def build_dataset_v2(history: dict, args) -> dict:
                     reward_r = (args.target_atr * atr) / stop_distance
                 for hold in args.holds:
                     outcome = resolve(
-                        m5, index, is_long=is_long, stop_distance=stop_distance,
+                        exec_bars, index, is_long=is_long, stop_distance=stop_distance,
                         reward_r=reward_r, max_hold=hold,
                     )
                     labels[hold].append(1 if outcome is True else 0)
-                rows.append(encode_row_v2(daily, fourh, is_long))
+                rows.append(encode_row_v2(macro, is_long))
                 rewards.append(reward_r)
-                costs.append(SPREAD_ATR * atr / stop_distance)
+                costs.append(args.spread_atr * atr / stop_distance)
                 stamps.append(now.timestamp())
                 sides.append(1 if is_long else -1)
                 kept += 1
@@ -234,7 +353,7 @@ def build_dataset_v2(history: dict, args) -> dict:
         "cost": np.asarray(costs, dtype=float)[order],
         "stamp": np.asarray(stamps, dtype=float)[order],
         "side": np.asarray(sides, dtype=int)[order],
-        "names": np.asarray(FEATURES_V2),
+        "names": np.asarray(feature_names_v2(args.macro_frames)),
     }
 
 
@@ -248,41 +367,40 @@ def build_dataset(history: dict, args) -> dict[str, np.ndarray]:
     rejected = {"no_features": 0, "no_swing": 0, "geometry": 0, "flat": 0}
 
     for symbol, frames in sorted(history.items()):
-        d1 = load_bars(symbol, frames.get("1d") or [], Timeframe.D1)
-        h4 = load_bars(symbol, frames.get("4h") or [], Timeframe.H4)
-        m5 = load_bars(symbol, frames.get("5m") or [], Timeframe.M5)
-        if len(d1) < D1_WINDOW or len(h4) < H4_WINDOW or len(m5) < M5_WINDOW:
-            print(f"  {symbol}: skipped (insufficient history)")
+        loaded = load_cascade(symbol, frames, args)
+        if loaded is None:
             continue
-        d1_ends = [bar.end for bar in d1]
-        h4_ends = [bar.end for bar in h4]
+        macro_bars, exec_bars = loaded
+        macro_ends = [[bar.end for bar in bars] for bars in macro_bars]
 
         kept = 0
-        for index in range(M5_WINDOW, len(m5) - max(args.holds) - 1, args.stride):
-            now = m5[index].end
+        for index in range(args.exec_window, len(exec_bars) - max(args.holds) - 1, args.stride):
+            now = exec_bars[index].end
             # Point-in-time: only bars already closed at this instant.
-            d1_cut = bisect.bisect_right(d1_ends, now)
-            h4_cut = bisect.bisect_right(h4_ends, now)
-            if d1_cut < D1_WINDOW or h4_cut < H4_WINDOW:
+            cuts = [bisect.bisect_right(ends, now) for ends in macro_ends]
+            if any(cut < args.macro_window for cut in cuts):
                 continue
-            micro = m5[index + 1 - M5_WINDOW : index + 1]
+            micro = exec_bars[index + 1 - args.exec_window : index + 1]
 
-            daily = encode_features(d1[d1_cut - D1_WINDOW : d1_cut], micro)
-            fourh = encode_features(h4[h4_cut - H4_WINDOW : h4_cut], micro)
-            if daily is None or fourh is None:
+            macro = [
+                encode_features(bars[cut - args.macro_window : cut], micro)
+                for bars, cut in zip(macro_bars, cuts)
+            ]
+            if any(f is None for f in macro):
                 rejected["no_features"] += 1
                 continue
 
-            # Direction is the top of the cascade: the daily tide.
-            if daily.macro_trend_score > 0:
+            # Direction is the top of the cascade: the coarsest frame's tide.
+            top = macro[0]
+            if top.macro_trend_score > 0:
                 side, is_long = 1, True
-            elif daily.macro_trend_score < 0:
+            elif top.macro_trend_score < 0:
                 side, is_long = -1, False
             else:
                 rejected["flat"] += 1
                 continue
 
-            entry = m5[index].close
+            entry = exec_bars[index].close
             atr = true_range_atr(micro, args.atr_length)
             if atr <= 0:
                 rejected["geometry"] += 1
@@ -316,26 +434,26 @@ def build_dataset(history: dict, args) -> dict[str, np.ndarray]:
             # comparison is like-for-like on identical rows.
             for hold in args.holds:
                 outcome = resolve(
-                    m5, index, is_long=is_long, stop_distance=stop_distance,
+                    exec_bars, index, is_long=is_long, stop_distance=stop_distance,
                     reward_r=reward_r, max_hold=hold,
                 )
                 # Velocity is part of the thesis: unresolved is a loss.
                 labels[hold].append(1 if outcome is True else 0)
 
-            rows.append(
-                [
-                    daily.macro_trend_score * side,
-                    daily.distance_to_support if is_long else daily.distance_to_resistance,
-                    daily.distance_to_resistance if is_long else daily.distance_to_support,
-                    fourh.macro_trend_score * side,
-                    fourh.distance_to_support if is_long else fourh.distance_to_resistance,
-                    fourh.distance_to_resistance if is_long else fourh.distance_to_support,
-                    daily.retracement_factor if is_long else 1.0 - daily.retracement_factor,
-                    daily.micro_wave_momentum * side,
+            row: list[float] = []
+            for f in macro:
+                row += [
+                    f.macro_trend_score * side,
+                    f.distance_to_support if is_long else f.distance_to_resistance,
+                    f.distance_to_resistance if is_long else f.distance_to_support,
                 ]
-            )
+            row += [
+                top.retracement_factor if is_long else 1.0 - top.retracement_factor,
+                top.micro_wave_momentum * side,
+            ]
+            rows.append(row)
             rewards.append(reward_r)
-            costs.append(SPREAD_ATR * atr / stop_distance)
+            costs.append(args.spread_atr * atr / stop_distance)
             stamps.append(now.timestamp())
             sides.append(side)
             kept += 1
@@ -350,7 +468,7 @@ def build_dataset(history: dict, args) -> dict[str, np.ndarray]:
         "cost": np.asarray(costs, dtype=float)[order],
         "stamp": np.asarray(stamps, dtype=float)[order],
         "side": np.asarray(sides, dtype=int)[order],
-        "names": np.asarray(FEATURES),
+        "names": np.asarray(feature_names_v1(args.macro_frames)),
     }
 
 
@@ -389,6 +507,28 @@ def gate_report(p_win: np.ndarray, data: dict, index: np.ndarray, label: str) ->
     }
 
 
+#: scikit-learn renamed the knob that selects L1 mid-way through the range this
+#: toolkit supports. Through 1.7, L1 is ``penalty="l1"`` and ``l1_ratio`` is read
+#: only when ``penalty="elasticnet"``. From 1.8, ``penalty`` is deprecated in
+#: favour of ``l1_ratio`` and is removed in 1.10; passing both raises an
+#: inconsistency warning. So the spelling has to be chosen, not guessed.
+_SKLEARN = tuple(int(part) for part in sklearn.__version__.split(".")[:2] if part.isdigit())
+_L1_BY_RATIO = _SKLEARN >= (1, 8)
+
+
+def lasso_logistic(c: float) -> LogisticRegression:
+    """L1-penalised logistic regression, spelled for the installed sklearn.
+
+    Lasso is the point of this script -- a feature that contributes nothing has
+    its weight driven to exactly zero, which is what the ZEROED verdict below
+    reports. The original call passed ``l1_ratio=1.0`` and left ``penalty`` at
+    its default, so on sklearn before 1.8 the "Lasso" reported here was ridge
+    and no weight could ever reach exactly zero.
+    """
+    knob = {"l1_ratio": 1.0} if _L1_BY_RATIO else {"penalty": "l1"}
+    return LogisticRegression(solver="liblinear", C=c, max_iter=2000, **knob)
+
+
 def train_and_report(data: dict, y: np.ndarray, hold: int, args) -> None:
     """Fit, evaluate out of sample, and run the cost gate for one time stop."""
     total = len(y)
@@ -397,7 +537,7 @@ def train_and_report(data: dict, y: np.ndarray, hold: int, args) -> None:
     print(f"TIME STOP {hold} bars ({hold * 5 / 60:.1f}h)   base rate {y.mean():.4f}")
     print("=" * 82)
 
-    train, test = purged_split(data, args.train_fraction, hold * 300)
+    train, test = purged_split(data, args.train_fraction, hold * args.exec_frame.seconds)
     scaler = StandardScaler().fit(data["X"][train])
     x_train, x_test = scaler.transform(data["X"][train]), scaler.transform(data["X"][test])
     y_train, y_test = y[train], y[test]
@@ -406,13 +546,13 @@ def train_and_report(data: dict, y: np.ndarray, hold: int, args) -> None:
     best, best_c = None, None
     inner = int(len(train) * 0.75)
     for c in (0.001, 0.01, 0.1, 1.0):
-        trial = LogisticRegression(solver="liblinear", l1_ratio=1.0, C=c, max_iter=2000)
+        trial = lasso_logistic(c)
         trial.fit(x_train[:inner], y_train[:inner])
         score = brier_score(list(trial.predict_proba(x_train[inner:])[:, 1]), list(y_train[inner:]))
         if best is None or score < best:
             best, best_c = score, c
 
-    model = LogisticRegression(solver="liblinear", l1_ratio=1.0, C=best_c, max_iter=2000)
+    model = lasso_logistic(best_c)
     model.fit(x_train, y_train)
     p_test = model.predict_proba(x_test)[:, 1]
 
@@ -450,9 +590,11 @@ def train_and_report(data: dict, y: np.ndarray, hold: int, args) -> None:
     reward = data["reward"][test]
     cost = data["cost"][test]
     need = float(np.mean([breakeven_probability(r, c) for r, c in zip(reward, cost)]))
+    auc_test = roc_auc_score(y_test, p_test)
+    calib = calibration_error(list(p_test), list(y_test))
     print(f"  Brier {model_brier:.5f} vs {base_brier:.5f} base "
-          f"(delta {base_brier - model_brier:+.5f}) | AUC {roc_auc_score(y_test, p_test):.4f} "
-          f"| calib {calibration_error(list(p_test), list(y_test)):.4f}")
+          f"(delta {base_brier - model_brier:+.5f}) | AUC {auc_test:.4f} "
+          f"| calib {calib:.4f}")
     print(f"  test base rate {y_test.mean():.4f} vs mean breakeven {need:.4f} "
           f"-> gap {need - y_test.mean():+.4f}")
 
@@ -466,13 +608,56 @@ def train_and_report(data: dict, y: np.ndarray, hold: int, args) -> None:
         print(f"  {row['label']:<24}{row['n']:>8}{row['win_rate']:>10.4f}"
               f"{row['total_r']:>11.1f}{row['mean_r']:>10.4f}")
 
+    # Persist. Without this the fitted estimator and its scaler are locals that
+    # die on return, which is why the platform had no model to serve: the whole
+    # output of a training run was the text above.
+    if args.save_model:
+        destination = Path(str(args.save_model).replace("{hold}", str(hold)))
+        saved = artifact.save(
+            destination,
+            model=model,
+            scaler=scaler,
+            feature_names=[str(n) for n in data["names"]],
+            exec_frame=args.exec_frame.value,
+            macro_frames=[f.value for f in args.macro_frames],
+            spread_atr=args.spread_atr,
+            encoding=args.encoding,
+            hold=hold,
+            metrics={
+                "brier": float(model_brier),
+                "auc": float(auc_test),
+                "calibration_error": float(calib),
+                "base_rate": float(y_test.mean()),
+                "n_train": float(len(train)),
+                "n_test": float(len(test)),
+            },
+        )
+        print(f"  saved {saved}")
+
 
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--history", type=Path, default=Path("data/mt5_history.json"))
+    parser.add_argument("--history", type=Path, default=Path("data/deriv_history.json"))
     parser.add_argument("--stride", type=int, default=5)
     parser.add_argument("--holds", type=int, nargs="+", default=[24],
-                        help="M5 bars for the time stop; several sweeps them")
+                        help="execution-frame bars for the time stop; several sweeps them")
+    parser.add_argument("--exec-frame", type=Timeframe, default=Timeframe.M1,
+                        choices=list(Timeframe), metavar="{1m,5m,15m,4h,1d,1w}",
+                        help="frame the trade is triggered and resolved on (default 1m)")
+    parser.add_argument("--macro-frames", type=Timeframe, nargs="+",
+                        default=[Timeframe.H4], choices=list(Timeframe),
+                        metavar="{1m,5m,15m,4h,1d,1w}",
+                        help="analysis frames; each must be coarser than "
+                             "--exec-frame (default 4h)")
+    parser.add_argument("--macro-window", type=int, default=MACRO_WINDOW,
+                        help="bars of history required per macro frame")
+    parser.add_argument("--exec-window", type=int, default=None,
+                        help="bars of history required on the execution frame; "
+                             "defaults to one whole UTC session at --exec-frame "
+                             "(1440 bars at 1m), never below 400")
+    parser.add_argument("--spread-atr", type=float, default=None,
+                        help="spread in ATR units; defaults per --exec-frame from the "
+                             "ADR-004 drag table (1m is extrapolated, not measured)")
     parser.add_argument("--target-atr", type=float, default=1.5)
     parser.add_argument("--target-mode", choices=("r", "atr"), default="r")
     parser.add_argument("--atr-length", type=int, default=14)
@@ -482,12 +667,46 @@ def main() -> None:
     parser.add_argument("--train-fraction", type=float, default=0.70)
     parser.add_argument("--encoding", choices=("v1", "v2"), default="v2",
                         help="v2 fixes the sign collapse, scaling and tails")
+    parser.add_argument("--save-model", type=Path, default=None,
+                        help="joblib path for the fitted model, its scaler and the "
+                             "assumptions it was fitted under; {hold} in the name is "
+                             "substituted when sweeping several time stops")
     parser.add_argument("--cache", type=Path, default=None,
                         help="npz path; reused if present, written if not")
     args = parser.parse_args()
 
+    # Coarsest first: the head of the cascade sets trade direction and supplies
+    # the two micro columns.
+    args.macro_frames = tuple(
+        sorted(dict.fromkeys(args.macro_frames), key=lambda f: -f.seconds)
+    )
+    # encode_features returns None for a macro frame that is not strictly coarser
+    # than the micro one, so a transposed cascade would land every row in
+    # "no_features" -- an empty dataset rather than an error. Catch it here.
+    too_fine = [f for f in args.macro_frames if f.seconds <= args.exec_frame.seconds]
+    if too_fine:
+        raise SystemExit(
+            f"--macro-frames must all be coarser than --exec-frame "
+            f"({args.exec_frame.value}); these are not: "
+            + ", ".join(f.value for f in too_fine)
+        )
+    if args.exec_window is None:
+        args.exec_window = default_exec_window(args.exec_frame)
+    if args.spread_atr is None:
+        args.spread_atr = default_spread_atr(args.exec_frame)
+        if args.spread_atr <= 0.0:
+            raise SystemExit(
+                f"no spread drag on record for {args.exec_frame.value}; "
+                "pass --spread-atr explicitly"
+            )
+
     unit = "x stop (R)" if args.target_mode == "r" else "xATR"
-    print("Point-in-time cascade: D1 bias -> H4 refinement -> M5 trigger")
+    cascade = " -> ".join(f.value for f in args.macro_frames)
+    print(f"Point-in-time cascade: {cascade} analysis -> {args.exec_frame.value} trigger")
+    drag = args.spread_atr / STOP_ATR_MULTIPLE
+    caveat = " EXTRAPOLATED, not measured" if args.exec_frame is Timeframe.M1 else ""
+    print(f"cost: spread {args.spread_atr:.4f} ATR = {drag:.4f}R drag at a "
+          f"{STOP_ATR_MULTIPLE}xATR stop;{caveat or ' measured (ADR-004)'}")
     print(f"target {args.target_atr}{unit}, structural stop, timeout counts as a loss\n")
 
     if args.cache and args.cache.exists():

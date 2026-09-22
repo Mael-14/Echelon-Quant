@@ -16,7 +16,10 @@ class BotManager:
     def __init__(self) -> None:
         self._bots: dict[str, BotRecord] = {}
         self._allowed_transitions: dict[BotLifecycleState, set[BotLifecycleState]] = {
-            BotLifecycleState.CREATED: {BotLifecycleState.STARTING, BotLifecycleState.EMERGENCY_STOP},
+            BotLifecycleState.CREATED: {
+                BotLifecycleState.STARTING,
+                BotLifecycleState.EMERGENCY_STOP,
+            },
             BotLifecycleState.STARTING: {
                 BotLifecycleState.RUNNING,
                 BotLifecycleState.ERROR,
@@ -40,7 +43,10 @@ class BotManager:
                 BotLifecycleState.ERROR,
                 BotLifecycleState.EMERGENCY_STOP,
             },
-            BotLifecycleState.STOPPED: {BotLifecycleState.STARTING, BotLifecycleState.EMERGENCY_STOP},
+            BotLifecycleState.STOPPED: {
+                BotLifecycleState.STARTING,
+                BotLifecycleState.EMERGENCY_STOP,
+            },
             BotLifecycleState.ERROR: {
                 BotLifecycleState.STARTING,
                 BotLifecycleState.STOPPING,
@@ -74,12 +80,16 @@ class BotManager:
         if config.bot_id != bot_id:
             raise ValueError("Path id must match body bot_id")
 
-        updated_status = current.status.model_copy(update={"last_heartbeat": datetime.now(timezone.utc)})
+        updated_status = current.status.model_copy(
+            update={"last_heartbeat": datetime.now(timezone.utc)}
+        )
         updated = BotRecord(config=config, status=updated_status)
         self._bots[bot_id] = updated
         return updated
 
-    def transition(self, bot_id: str, target: BotLifecycleState, error: str | None = None) -> BotStatus:
+    def transition(
+        self, bot_id: str, target: BotLifecycleState, error: str | None = None
+    ) -> BotStatus:
         current = self._bots.get(bot_id)
         if current is None:
             raise KeyError(f"Bot '{bot_id}' not found")

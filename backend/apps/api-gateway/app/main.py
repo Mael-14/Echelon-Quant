@@ -1,15 +1,14 @@
-from fastapi import FastAPI, HTTPException, Path, status
-from fastapi.responses import JSONResponse
-from pydantic import BaseModel
-
 import asyncio
-from typing import Any
-from urllib.request import Request, urlopen
-from urllib.error import HTTPError, URLError
 import json
+from typing import Any
+from urllib.error import HTTPError, URLError
+from urllib.request import Request, urlopen
 
 import asyncpg
 import httpx
+from fastapi import FastAPI, HTTPException, Path, status
+from fastapi.responses import JSONResponse
+from pydantic import BaseModel
 
 from backend.shared.config import get_settings
 from backend.shared.health import build_health_response
@@ -98,7 +97,8 @@ async def store_deriv_token(payload: DerivTokenIn) -> dict:
     async with pool.acquire() as conn:
         await conn.execute(
             "INSERT INTO deriv_tokens(user_id, token, account_id, app_id) VALUES($1,$2,$3,$4) "
-            "ON CONFLICT(user_id) DO UPDATE SET token=EXCLUDED.token, account_id=EXCLUDED.account_id, app_id=EXCLUDED.app_id, created_at=now()",
+            "ON CONFLICT(user_id) DO UPDATE SET token=EXCLUDED.token, "
+            "account_id=EXCLUDED.account_id, app_id=EXCLUDED.app_id, created_at=now()",
             payload.user_id,
             enc,
             payload.account_id,
@@ -135,11 +135,13 @@ async def list_deriv_accounts(user_id: str = Path(min_length=1)) -> Any:
 
     try:
         result = await asyncio.to_thread(_fetch_accounts)
-    except Exception:
-        raise HTTPException(status_code=status.HTTP_502_BAD_GATEWAY, detail="Failed to fetch accounts from Deriv")
+    except Exception as exc:
+        raise HTTPException(
+            status_code=status.HTTP_502_BAD_GATEWAY,
+            detail="Failed to fetch accounts from Deriv",
+        ) from exc
 
     return result
-
 
 
 class OAuthExchangeIn(BaseModel):
@@ -174,19 +176,25 @@ async def deriv_oauth_exchange(payload: OAuthExchangeIn) -> dict:
 
     try:
         result = await asyncio.to_thread(_exchange)
-    except Exception:
-        raise HTTPException(status_code=status.HTTP_502_BAD_GATEWAY, detail="OAuth exchange failed")
+    except Exception as exc:
+        raise HTTPException(
+            status_code=status.HTTP_502_BAD_GATEWAY,
+            detail="OAuth exchange failed",
+        ) from exc
 
     access_token = result.get("access_token") if isinstance(result, dict) else None
     if not access_token:
-        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="No access_token in response")
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST, detail="No access_token in response"
+        )
 
     # store token for user
     pool = await _ensure_db_pool()
     enc = encrypt_token(access_token, settings=settings)
     async with pool.acquire() as conn:
         await conn.execute(
-            "INSERT INTO deriv_tokens(user_id, token) VALUES($1,$2) ON CONFLICT(user_id) DO UPDATE SET token=EXCLUDED.token, created_at=now()",
+            "INSERT INTO deriv_tokens(user_id, token) VALUES($1,$2) "
+            "ON CONFLICT(user_id) DO UPDATE SET token=EXCLUDED.token, created_at=now()",
             payload.user_id,
             enc,
         )

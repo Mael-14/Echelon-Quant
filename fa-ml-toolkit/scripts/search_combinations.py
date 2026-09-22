@@ -31,16 +31,14 @@ Usage:
 from __future__ import annotations
 
 import argparse
-import sys
 from itertools import combinations
 from math import sqrt
 from pathlib import Path
 
 import numpy as np
 
-sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
-
-from forex_agent.strategy.expectancy import breakeven_probability  # noqa: E402
+from forex_agent.models import Timeframe
+from forex_agent.strategy.expectancy import breakeven_probability
 
 #: Quantile cut points, computed on the training split only.
 QUANTILES = (15, 30, 70, 85)
@@ -167,7 +165,12 @@ def gate_rows(p_win, data, index, thresholds) -> list[dict]:
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--cache", type=Path, required=True)
-    parser.add_argument("--hold", type=int, default=24)
+    parser.add_argument("--hold", type=int, default=24,
+                        help="time stop, in --exec-frame bars")
+    parser.add_argument("--exec-frame", type=Timeframe, default=Timeframe.M1,
+                        choices=list(Timeframe), metavar="{1m,5m,15m,4h,1d,1w}",
+                        help="frame the cached dataset was built on; sets the "
+                             "purge horizon (default 1m)")
     parser.add_argument("--train-fraction", type=float, default=0.70)
     parser.add_argument("--min-support", type=int, default=250)
     parser.add_argument("--top", type=int, default=15)
@@ -177,7 +180,7 @@ def main() -> None:
     r_values = realised_r(data)
     stamps = data["stamp"]
     cut = stamps[int(len(stamps) * args.train_fraction)]
-    train = np.where(stamps + args.hold * 300 < cut)[0]
+    train = np.where(stamps + args.hold * args.exec_frame.seconds < cut)[0]
     test = np.where(stamps >= cut)[0]
 
     print(f"hold {args.hold} bars | {len(data['y'])} rows "

@@ -1,0 +1,4 @@
+Trained model artifacts live here. They are not committed: ADR-004 deleted the
+previous ones on purpose, and a .joblib is regenerable from history plus a
+training command. docker-compose mounts this directory into analysis-service
+read-only, so retraining does not mean rebuilding the image.

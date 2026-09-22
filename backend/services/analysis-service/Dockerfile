@@ -2,7 +2,7 @@ FROM python:3.12-slim
 
 WORKDIR /app
 COPY . /app
-WORKDIR /app/backend/services/execution-service
+WORKDIR /app/backend/services/analysis-service
 
 RUN pip install --no-cache-dir --upgrade pip &&     pip install --no-cache-dir -r requirements.txt &&     pip install --no-cache-dir -e /app/fa-ml-toolkit
 

@@ -15,16 +15,13 @@ import argparse
 import asyncio
 import csv
 import json
-import sys
 from datetime import datetime, timezone
 from pathlib import Path
 
-sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
+import httpx
+import websockets
 
-import httpx  # noqa: E402
-import websockets  # noqa: E402
-
-from forex_agent.config import settings  # noqa: E402
+from forex_agent.config import settings
 
 PUBLIC_WS = "wss://api.derivws.com/trading/v1/options/ws/public"
 DEFAULT_SYMBOLS = ("frxEURUSD", "frxGBPUSD", "frxUSDJPY", "frxAUDUSD", "R_75", "1HZ75V")
@@ -106,6 +103,10 @@ async def main() -> None:
     parser.add_argument("--symbols", nargs="+", default=list(DEFAULT_SYMBOLS))
     parser.add_argument("--frames", nargs="+", default=list(GRANULARITY))
     parser.add_argument("--count", type=int, default=20_000, help="target candles per frame")
+    parser.add_argument("--exec-frame", default="1m", choices=list(GRANULARITY),
+                        help="frame that gets the full --count; the rest get a "
+                             "quarter of it, since they are only the macro "
+                             "context behind it (default 1m)")
     args = parser.parse_args()
 
     url = await _socket_url()
@@ -118,7 +119,7 @@ async def main() -> None:
             history[symbol] = {}
             summary = []
             for frame in args.frames:
-                target = args.count if frame == "5m" else max(500, args.count // 4)
+                target = args.count if frame == args.exec_frame else max(500, args.count // 4)
                 candles = await fetch_frame(ws, symbol, frame, target)
                 history[symbol][frame] = candles
                 print(f"    {symbol} {frame}: {len(candles)}", flush=True)

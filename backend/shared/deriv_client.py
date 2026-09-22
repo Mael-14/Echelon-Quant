@@ -144,7 +144,9 @@ class DerivClient:
 
         try:
             websocket = await self._websocket_factory(websocket_url)
-        except Exception as exc:  # pragma: no cover - connection factory errors bubble up as client errors
+        except (
+            Exception
+        ) as exc:  # pragma: no cover - connection factory errors bubble up as client errors
             raise DerivClientError(f"Failed to connect to Deriv at {websocket_url}") from exc
 
         self._websocket = websocket

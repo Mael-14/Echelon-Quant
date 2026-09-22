@@ -157,6 +157,89 @@ services:
       redis:
         condition: service_healthy
 
+  analysis-service:
+    build:
+      context: .
+      dockerfile: backend/services/analysis-service/Dockerfile
+    container_name: echelon-analysis-service
+    restart: unless-stopped
+    environment:
+      APP_NAME: ${APP_NAME:-Echelon Quant}
+      ENVIRONMENT: ${ENVIRONMENT:-development}
+      DEBUG: ${DEBUG:-false}
+      POSTGRES_HOST: postgres
+      POSTGRES_PORT: ${POSTGRES_PORT:-5432}
+      POSTGRES_DB: ${POSTGRES_DB:-echelon_quant}
+      POSTGRES_USER: ${POSTGRES_USER:-postgres}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-postgres}
+      REDIS_HOST: redis
+      REDIS_PORT: ${REDIS_PORT:-6379}
+      REDIS_DB: ${REDIS_DB:-0}
+      DERIV_TOKEN: ${DERIV_TOKEN:-}
+      DERIV_APP_ID: ${DERIV_APP_ID:-}
+      DERIV_V3_WS_URL: ${DERIV_V3_WS_URL:-wss://ws.derivws.com/websockets/v3}
+      # The cascade. The artifact records what it was trained on, and a
+      # disagreement makes this service degraded rather than silently wrong.
+      ANALYSIS_MODEL_PATH: ${ANALYSIS_MODEL_PATH:-/app/artifacts/scalp_m1.joblib}
+      ANALYSIS_EXEC_FRAME: ${ANALYSIS_EXEC_FRAME:-1m}
+      ANALYSIS_MACRO_FRAMES: ${ANALYSIS_MACRO_FRAMES:-4h}
+      ANALYSIS_SYMBOLS: ${ANALYSIS_SYMBOLS:-frxEURUSD}
+    volumes:
+      # Artifacts are trained on the host and mounted read-only; they are not
+      # baked into the image, so retraining does not mean rebuilding.
+      - ./artifacts:/app/artifacts:ro
+    dns:
+      - 8.8.8.8
+      - 1.1.1.1
+    ports:
+      - "8004:8000"
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+
+  execution-service:
+    build:
+      context: .
+      dockerfile: backend/services/execution-service/Dockerfile
+    container_name: echelon-execution-service
+    restart: unless-stopped
+    environment:
+      APP_NAME: ${APP_NAME:-Echelon Quant}
+      ENVIRONMENT: ${ENVIRONMENT:-development}
+      DEBUG: ${DEBUG:-false}
+      POSTGRES_HOST: postgres
+      POSTGRES_PORT: ${POSTGRES_PORT:-5432}
+      POSTGRES_DB: ${POSTGRES_DB:-echelon_quant}
+      POSTGRES_USER: ${POSTGRES_USER:-postgres}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-postgres}
+      REDIS_HOST: redis
+      REDIS_PORT: ${REDIS_PORT:-6379}
+      REDIS_DB: ${REDIS_DB:-0}
+      DERIV_TOKEN: ${DERIV_TOKEN:-}
+      DERIV_APP_ID: ${DERIV_APP_ID:-}
+      DERIV_V3_WS_URL: ${DERIV_V3_WS_URL:-wss://ws.derivws.com/websockets/v3}
+      # Defaults to demo. Execution refuses to place any order unless this is
+      # demo, so leaving it unset cannot reach a real-money account.
+      DERIV_TRADE_MODE: ${DERIV_TRADE_MODE:-demo}
+      DERIV_MULTIPLIER: ${DERIV_MULTIPLIER:-100}
+      DERIV_STAKE: ${DERIV_STAKE:-10}
+      DERIV_CURRENCY: ${DERIV_CURRENCY:-USD}
+      EXECUTION_MAX_OPEN_POSITIONS: ${EXECUTION_MAX_OPEN_POSITIONS:-1}
+      EXECUTION_DAILY_LOSS_LIMIT_R: ${EXECUTION_DAILY_LOSS_LIMIT_R:-5}
+      EXECUTION_RISK_PCT: ${EXECUTION_RISK_PCT:-0.01}
+    dns:
+      - 8.8.8.8
+      - 1.1.1.1
+    ports:
+      - "8006:8000"
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+
   # One-off migration runner: `docker compose --profile tools run --rm migrate`.
   # Run this against a fresh database before starting the app services above -
   # they no longer create their own tables at startup (see backend/alembic/).

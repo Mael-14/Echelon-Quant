@@ -28,6 +28,7 @@ Feature branches should use one of these forms:
   - `Lint`
   - `Type check`
   - `Tests`
+  - `ML toolkit tests`
   - `Docker build`
   - `CodeQL analysis`
   - `Dependency review` for pull requests

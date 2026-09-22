@@ -33,24 +33,22 @@ the unfavourable reading cannot flatter the result.
 
 Usage:
 
-    python scripts/backtest_scalp.py --history data/mt5_history.json
+    python scripts/backtest_scalp.py --history data/deriv_history.json
 """
 from __future__ import annotations
 
 import argparse
 import bisect
 import json
-import sys
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta, timezone
+from math import sqrt
 from pathlib import Path
 
-sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
-
-from forex_agent.execution.exit_policy import ExitPolicy, evaluate_exit  # noqa: E402
-from forex_agent.models import Bar, Side, Timeframe  # noqa: E402
-from forex_agent.strategy.features import pivot_levels  # noqa: E402
-from forex_agent.strategy.indicators import (  # noqa: E402
+from forex_agent.execution.exit_policy import ExitPolicy, evaluate_exit
+from forex_agent.models import Bar, Side, Timeframe
+from forex_agent.strategy.features import pivot_levels
+from forex_agent.strategy.indicators import (
     candlestick_confirmation,
     ema,
     swing_points,
@@ -58,11 +56,30 @@ from forex_agent.strategy.indicators import (  # noqa: E402
 )
 
 MACRO_WINDOW = 400
-M5_WINDOW = 200
+EXEC_WINDOW = 200
 
-#: ADR-004 measured M5 spread drag at 0.095R against a 1.5xATR stop, so the
-#: spread is about 0.1425 ATR. Charged once per round trip.
-SPREAD_ATR = 0.095 * 1.5
+#: Spread drag in R against a 1.5xATR stop, per execution frame, charged once
+#: per round trip. Cost in R is spread/stop_distance and ATR grows with the
+#: square root of time, so the drag falls as 1/sqrt(time) -- ADR-004 calls this
+#: the largest lever on expectancy the toolkit found.
+#:
+#: M5, M15, H4 and D1 are measured. **M1 is extrapolated** from M5 by that same
+#: law, and the law reproduces the measured cells only to within about 20%, so
+#: re-measure it against a real Deriv spread before trusting an M1 result.
+SPREAD_DRAG_R = {
+    Timeframe.M1: 0.095 * sqrt(300 / 60),
+    Timeframe.M5: 0.095,
+    Timeframe.M15: 0.045,
+    Timeframe.H4: 0.017,
+    Timeframe.D1: 0.007,
+}
+STOP_ATR_MULTIPLE = 1.5
+
+
+def default_spread_atr(frame: Timeframe) -> float:
+    """Spread in ATR units for an execution frame, or 0 if it has no entry."""
+    drag = SPREAD_DRAG_R.get(frame)
+    return drag * STOP_ATR_MULTIPLE if drag is not None else 0.0
 
 
 @dataclass(slots=True)
@@ -132,14 +149,14 @@ def precompute_entries(d1, h4, m5, args) -> tuple[dict[int, dict], dict[str, int
     -- the cascade and the M5 structure read -- does not depend on the exit.
     """
     d1_ends = [bar.end for bar in d1]
-    h4_ends = [bar.end for bar in h4]
+    h4_ends = [bar.end for bar in h4] if h4 is not None else []
     signals: dict[int, dict] = {}
     funnel = {"bars": 0, "candle": 0, "trend": 0, "pullback": 0, "structure": 0, "geometry": 0}
 
     d1_cut = h4_cut = -1
     daily = fourh = None
 
-    for index in range(M5_WINDOW, len(m5)):
+    for index in range(args.exec_window, len(m5)):
         funnel["bars"] += 1
         bar = m5[index]
         recent = m5[max(0, index - args.candle_within) : index + 1]
@@ -157,22 +174,25 @@ def precompute_entries(d1, h4, m5, args) -> tuple[dict[int, dict], dict[str, int
         # The cascade, refreshed only when a structural bar has closed.
         now = bar.end
         new_d1 = bisect.bisect_right(d1_ends, now)
-        new_h4 = bisect.bisect_right(h4_ends, now)
         if new_d1 != d1_cut:
             d1_cut, daily = new_d1, macro_state(d1, new_d1, args)
-        if new_h4 != h4_cut:
-            h4_cut, fourh = new_h4, macro_state(h4, new_h4, args)
-        if daily is None or fourh is None or not daily.levels:
+        if h4 is not None:
+            new_h4 = bisect.bisect_right(h4_ends, now)
+            if new_h4 != h4_cut:
+                h4_cut, fourh = new_h4, macro_state(h4, new_h4, args)
+            if fourh is None:
+                continue
+        if daily is None or not daily.levels:
             continue
 
         want = 1.0 if side is Side.BUY else -1.0
         if daily.trend_score * want < args.min_trend:
             continue
-        if fourh.trend_score * want < 0:
+        if fourh is not None and fourh.trend_score * want < 0:
             continue
         funnel["trend"] += 1
 
-        window = m5[max(0, index + 1 - M5_WINDOW) : index + 1]
+        window = m5[max(0, index + 1 - args.exec_window) : index + 1]
         swing = swing_points(window, strength=2, lookback=args.swing_lookback)
         high, low = swing["high"], swing["low"]
         if high is None or low is None or high <= low:
@@ -222,7 +242,7 @@ def simulate(symbol, m5, signals, policy, args) -> list[Trade]:
     open_trade: Trade | None = None
     stop_now = peak = 0.0
 
-    for index in range(M5_WINDOW, len(m5)):
+    for index in range(args.exec_window, len(m5)):
         bar = m5[index]
 
         if open_trade is not None:
@@ -343,7 +363,7 @@ def report(trades: list[Trade], title: str) -> None:
 
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--history", type=Path, default=Path("data/mt5_history.json"))
+    parser.add_argument("--history", type=Path, default=Path("data/deriv_history.json"))
     parser.add_argument("--symbols", nargs="+", default=None,
                         help="restrict to these symbols; default is every symbol in the file")
     parser.add_argument("--reward", type=float, default=1.5)
@@ -358,12 +378,47 @@ def main() -> None:
     parser.add_argument("--max-structure-atr", type=float, default=8.0)
     parser.add_argument("--min-stop-atr", type=float, default=0.3)
     parser.add_argument("--max-stop-atr", type=float, default=5.0)
-    parser.add_argument("--spread-atr", type=float, default=SPREAD_ATR)
+    parser.add_argument("--spread-atr", type=float, default=None,
+                        help="spread in ATR units; defaults per --exec-frame from "
+                             "the ADR-004 drag table (1m is extrapolated)")
+    parser.add_argument("--structure-frame", type=Timeframe, default=Timeframe.H4,
+                        choices=list(Timeframe), metavar="{1m,5m,15m,4h,1d,1w}",
+                        help="frame supplying key levels and the primary trend "
+                             "(default 4h)")
+    parser.add_argument("--confirm-frame", type=Timeframe, default=None,
+                        choices=list(Timeframe), metavar="{1m,5m,15m,4h,1d,1w}",
+                        help="optional second trend filter between structure and "
+                             "execution; omit for a single-frame cascade")
+    parser.add_argument("--exec-frame", type=Timeframe, default=Timeframe.M1,
+                        choices=list(Timeframe), metavar="{1m,5m,15m,4h,1d,1w}",
+                        help="frame the trade is triggered and simulated on (default 1m)")
+    parser.add_argument("--exec-window", type=int, default=EXEC_WINDOW,
+                        help="trailing execution bars for swings and ATR")
     parser.add_argument("--hold-seconds", type=float, default=900.0)
     parser.add_argument("--breakeven-at-r", type=float, default=0.7)
     parser.add_argument("--trail-at-r", type=float, default=1.2)
     parser.add_argument("--trail-distance-r", type=float, default=0.6)
     args = parser.parse_args()
+
+    # Each frame in the cascade must be strictly coarser than the one below it,
+    # or the "structure" being read is the execution frame's own noise.
+    chain = [args.structure_frame]
+    if args.confirm_frame is not None:
+        chain.append(args.confirm_frame)
+    chain.append(args.exec_frame)
+    for coarser, finer in zip(chain, chain[1:]):
+        if coarser.seconds <= finer.seconds:
+            raise SystemExit(
+                f"cascade must run coarse to fine; {coarser.value} does not sit "
+                f"above {finer.value}"
+            )
+    if args.spread_atr is None:
+        args.spread_atr = default_spread_atr(args.exec_frame)
+        if args.spread_atr <= 0.0:
+            raise SystemExit(
+                f"no spread drag on record for {args.exec_frame.value}; "
+                "pass --spread-atr explicitly"
+            )
 
     managed = ExitPolicy(
         max_hold_seconds=args.hold_seconds, breakeven_at_r=args.breakeven_at_r,
@@ -374,7 +429,11 @@ def main() -> None:
     fixed = ExitPolicy(max_hold_seconds=args.hold_seconds)
 
     history = json.loads(args.history.read_text())
-    print("Sequential M5 backtest -- one position at a time, candle-triggered")
+    cascade = " -> ".join(f.value for f in chain)
+    print(f"Sequential backtest ({cascade}) -- one position at a time, candle-triggered")
+    drag = args.spread_atr / STOP_ATR_MULTIPLE
+    caveat = " EXTRAPOLATED, not measured" if args.exec_frame is Timeframe.M1 else " measured (ADR-004)"
+    print(f"cost: spread {args.spread_atr:.4f} ATR = {drag:.4f}R per round trip;{caveat}")
     print(f"exit: hold {args.hold_seconds:.0f}s, breakeven {args.breakeven_at_r}R, "
           f"trail {args.trail_at_r}R by {args.trail_distance_r}R, reward {args.reward}R\n")
 
@@ -384,11 +443,23 @@ def main() -> None:
     for symbol, frames in sorted(history.items()):
         if args.symbols and symbol not in args.symbols:
             continue
-        d1 = load_bars(symbol, frames.get("1d") or [], Timeframe.D1)
-        h4 = load_bars(symbol, frames.get("4h") or [], Timeframe.H4)
-        m5 = load_bars(symbol, frames.get("5m") or [], Timeframe.M5)
-        if len(d1) < args.ema_length or len(h4) < args.ema_length or len(m5) < M5_WINDOW:
-            print(f"  {symbol}: skipped")
+        d1 = load_bars(symbol, frames.get(args.structure_frame.value) or [], args.structure_frame)
+        if args.confirm_frame is None:
+            h4 = None
+        else:
+            h4 = load_bars(symbol, frames.get(args.confirm_frame.value) or [], args.confirm_frame)
+        m5 = load_bars(symbol, frames.get(args.exec_frame.value) or [], args.exec_frame)
+        if len(d1) < args.ema_length:
+            print(f"  {symbol}: skipped ({args.structure_frame.value} has {len(d1)} "
+                  f"bars, needs {args.ema_length})")
+            continue
+        if h4 is not None and len(h4) < args.ema_length:
+            print(f"  {symbol}: skipped ({args.confirm_frame.value} has {len(h4)} "
+                  f"bars, needs {args.ema_length})")
+            continue
+        if len(m5) < args.exec_window:
+            print(f"  {symbol}: skipped ({args.exec_frame.value} has {len(m5)} "
+                  f"bars, needs {args.exec_window})")
             continue
         signals, funnel = precompute_entries(d1, h4, m5, args)
         for key in totals:

@@ -1,0 +1,27 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "fa-ml-toolkit"
+version = "0.1.0"
+description = "Multi-timeframe feature encoding, triple-barrier labelling, and the measurement apparatus for deciding whether a trading model is worth building."
+readme = "README.md"
+requires-python = ">=3.11"
+dependencies = [
+    "numpy>=1.26",
+    "scikit-learn>=1.3",
+    "joblib>=1.3",
+]
+
+[project.optional-dependencies]
+# Only scripts/search_combinations.py, and it imports lazily.
+search = ["xgboost>=2.0"]
+# Only the Deriv downloader. Both are already in backend/requirements/base.txt.
+download = ["httpx>=0.27.0", "websockets>=12.0"]
+# indicators.py prefers pandas-ta and falls back to pure Python when absent.
+pandas = ["pandas>=2.0,<3.0", "pandas-ta>=0.3.14b"]
+dev = ["pytest>=8.0"]
+
+[tool.setuptools.packages.find]
+include = ["forex_agent*"]

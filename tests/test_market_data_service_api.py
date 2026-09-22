@@ -17,7 +17,15 @@ class FakePipeline:
     async def stop(self):
         return None
 
-    async def subscribe_for_bot(self, *, user_id: str, symbol: str, bot_id: str, account_id: str | None = None, app_id: int | None = None):
+    async def subscribe_for_bot(
+        self,
+        *,
+        user_id: str,
+        symbol: str,
+        bot_id: str,
+        account_id: str | None = None,
+        app_id: int | None = None,
+    ):
         key = f"{user_id}:{symbol}:{bot_id}"
         self._tasks[key] = True
         return key
@@ -35,9 +43,9 @@ def _import_market_data_service_main(*, purge_cache: bool):
     # purge any cached `app`/`app.*` modules once per test to avoid picking up the wrong
     # service - but only on the *first* import of the test, so the module we patch below
     # is the same one the test later runs against.
+    import importlib
     import sys
     from pathlib import Path
-    import importlib
 
     repo_root = Path(__file__).resolve().parents[1]
     service_dir = repo_root / "backend" / "services" / "market-data-service"

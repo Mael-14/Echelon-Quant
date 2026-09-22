@@ -105,6 +105,36 @@ jobs:
       - name: Run test suite
         run: python -m pytest -q
 
+  ml-tests:
+    name: ML toolkit tests
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+          cache-dependency-path: |
+            fa-ml-toolkit/pyproject.toml
+            fa-ml-toolkit/requirements.txt
+
+      - name: Install the toolkit
+        run: python -m pip install -e './fa-ml-toolkit[dev]'
+
+      # Run from the toolkit's own rootdir. fa-ml-toolkit/tests is deliberately
+      # kept out of the root testpaths: every service exposes a top-level package
+      # named `app` and the root suite depends on a sys.modules purge that
+      # widening collection would break.
+      - name: Run toolkit test suite
+        working-directory: fa-ml-toolkit
+        run: python -m pytest -q
+
   docker:
     name: Docker image matrix
     runs-on: ubuntu-latest
@@ -121,6 +151,8 @@ jobs:
             dockerfile: backend/services/bot-service/Dockerfile
           - name: market-data-service
             dockerfile: backend/services/market-data-service/Dockerfile
+          - name: analysis-service
+            dockerfile: backend/services/analysis-service/Dockerfile
           - name: strategy-ai-service
             dockerfile: backend/services/strategy-ai-service/Dockerfile
           - name: risk-service

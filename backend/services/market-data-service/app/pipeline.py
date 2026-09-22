@@ -20,6 +20,10 @@ from backend.shared.observability import (
 
 log = logging.getLogger("market-data-pipeline")
 
+#: What redis-py accepts as a stream field key or value. Spelled out because
+#: `dict` is invariant, so an inferred `dict[str, str]` does not satisfy it.
+StreamField = bytes | bytearray | memoryview | str | int | float
+
 
 @dataclass
 class MarketTick:
@@ -204,7 +208,7 @@ class MarketDataPipeline:
 
                 MARKET_DATA_TICKS_PROCESSED.labels(symbol=symbol).inc()
 
-                payload = {
+                payload: dict[StreamField, StreamField] = {
                     "ts": tick.ts.isoformat(),
                     "symbol": tick.symbol,
                     "price": str(tick.price) if tick.price is not None else "",
@@ -295,6 +299,10 @@ class MarketDataPipeline:
             tick_obj = data["history"].get("last")
         else:
             # Unknown message type
+            return None
+
+        if not isinstance(tick_obj, dict):
+            # "history" was present but carried no usable "last" object.
             return None
 
         # timestamp

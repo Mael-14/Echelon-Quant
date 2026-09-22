@@ -84,16 +84,31 @@ data/deriv_history.json     Sample history so the scripts run immediately.
 
 ## Install
 
+Install the toolkit as a package so `import forex_agent` resolves from anywhere —
+the scripts no longer prepend to `sys.path`, and any service in the platform can
+import it the same way.
+
 ```bash
 python -m venv .venv
 .venv\Scripts\activate          # Windows
-pip install -r requirements.txt
-python -m pytest -q             # 23 tests should pass
+pip install -e '.[dev]'         # or, from the repo root: make install-ml
+python -m pytest -q             # 27 tests should pass
 ```
 
-Python 3.11. `numpy` and `scikit-learn` are required; `xgboost` only for
-`search_combinations.py`. `pandas` and `pandas-ta` are **optional** — the
-indicators fall back to pure-Python implementations when they are absent.
+Python 3.11 or newer; the suite runs on 3.12 in CI and on 3.14 locally.
+`numpy`, `scikit-learn` and `joblib` are required. The rest are extras, each
+needed by one thing only:
+
+| extra      | pulls in              | needed by                                                 |
+| ---------- | --------------------- | --------------------------------------------------------- |
+| `search`   | `xgboost`             | `scripts/search_combinations.py`, which imports it lazily  |
+| `download` | `httpx`, `websockets` | `scripts/download_deriv_training_data.py`                  |
+| `pandas`   | `pandas`, `pandas-ta` | nothing — `indicators.py` falls back to equivalent pure-Python implementations when absent |
+| `dev`      | `pytest`              | the test suite                                             |
+
+`scripts/download_mt5_training_data.py` additionally needs `MetaTrader5`, a
+Windows-only wheel that drives a desktop terminal over local IPC, so it is left
+out of the extras entirely.
 
 ---
 
@@ -159,20 +174,44 @@ Measure the offset against your own clock and subtract it.
 
 ---
 
+## Choosing the cascade
+
+Every script takes the cascade as flags rather than assuming one. The default is
+**H4 analysis into an M1 trigger** (`--macro-frames 4h --exec-frame 1m`); the
+frames the toolkit was originally written around are one flag away
+(`--macro-frames 1d 4h --exec-frame 5m`).
+
+Each macro frame must be strictly coarser than the execution frame, which the
+scripts check and refuse rather than silently encoding nothing.
+
+Two things follow from the execution frame automatically, and both matter:
+
+| | why it is not a constant |
+|---|---|
+| **spread drag** | Cost in R is `spread / stop_distance` and ATR grows as √time, so drag falls as 1/√time: **0.017R at H4, 0.095R at M5, ~0.21R at M1.** It sets the breakeven line every verdict is measured against, so a frame-independent default would flatter a fast frame by more than 10×. **The M1 figure is extrapolated from M5, not measured** — re-measure it against a real Deriv spread before trusting an M1 result. |
+| **execution window** | `momentum` is the close's distance from the session VWAP, and `vwap` anchors to the newest UTC day *in the window*. A day is 288 M5 bars but **1440 M1 bars**, so a fixed 400-bar window would silently re-anchor to a partial session at M1. The default is now one whole session, floored at 400. |
+
+The bundled `data/deriv_history.json` carries no `1m` frame, so the default
+cascade skips every symbol until fresh history is downloaded:
+
+```bash
+python scripts/download_deriv_training_data.py --exec-frame 1m --count 40000 --raw data/deriv_m1.json
+```
+
 ## Suggested order
 
 ```bash
 # 1. Is there an edge at all? Read the MDE column before the z column.
-python scripts/null_test_conditional.py --history data/deriv_history.json
+python scripts/null_test_conditional.py --history data/deriv_m1.json --macro 4h --micro 1m
 
 # 2. Only if step 1 deviates: build labels and fit.
-python scripts/train_scalp_model.py --history data/deriv_history.json
+python scripts/train_scalp_model.py --history data/deriv_m1.json --macro-frames 4h --exec-frame 1m
 
 # 3. Search interactions; compare against XGBoost.
-python scripts/search_combinations.py --cache dataset.npz --hold 24
+python scripts/search_combinations.py --cache dataset.npz --hold 24 --exec-frame 1m
 
 # 4. What an account would actually have done.
-python scripts/backtest_scalp.py --history data/deriv_history.json
+python scripts/backtest_scalp.py --history data/deriv_m1.json --structure-frame 4h --exec-frame 1m
 ```
 
 Score everything in **R after cost**, never accuracy. A filter that lifts the

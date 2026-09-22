@@ -10,6 +10,7 @@ respectively). This migration captures the exact same DDL those services were
 issuing, using `IF NOT EXISTS` so it's safe to run against a dev database that
 already has the tables from the old ad-hoc path.
 """
+
 from __future__ import annotations
 
 from typing import Sequence, Union

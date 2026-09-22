@@ -4,7 +4,7 @@ import asyncio
 import logging
 from typing import Any
 
-from fastapi import FastAPI, HTTPException, status, Response
+from fastapi import FastAPI, HTTPException, Response, status
 from pydantic import BaseModel
 
 from backend.shared.config import get_settings
@@ -48,28 +48,66 @@ async def metrics():
 async def subscribe(req: SubscribeRequest):
     pipeline = getattr(app.state, "_market_data_pipeline", None)
     if pipeline is None:
-        raise HTTPException(status_code=status.HTTP_503_SERVICE_UNAVAILABLE, detail="market-data pipeline not running")
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail="market-data pipeline not running",
+        )
     try:
-        key = await pipeline.subscribe_for_bot(user_id=req.user_id, symbol=req.symbol, bot_id=req.bot_id, account_id=req.account_id, app_id=req.app_id)
-        log.info("Started subscription %s for user=%s symbol=%s bot=%s", key, req.user_id, req.symbol, req.bot_id)
+        key = await pipeline.subscribe_for_bot(
+            user_id=req.user_id,
+            symbol=req.symbol,
+            bot_id=req.bot_id,
+            account_id=req.account_id,
+            app_id=req.app_id,
+        )
+        log.info(
+            "Started subscription %s for user=%s symbol=%s bot=%s",
+            key,
+            req.user_id,
+            req.symbol,
+            req.bot_id,
+        )
         return {"subscription_key": key}
-    except Exception:
-        log.exception("Failed to start subscription for user=%s symbol=%s bot=%s", req.user_id, req.symbol, req.bot_id)
-        raise HTTPException(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, detail="failed to start subscription")
+    except Exception as exc:
+        log.exception(
+            "Failed to start subscription for user=%s symbol=%s bot=%s",
+            req.user_id,
+            req.symbol,
+            req.bot_id,
+        )
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail="failed to start subscription",
+        ) from exc
 
 
 @app.post("/api/v1/market/unsubscribe", status_code=status.HTTP_204_NO_CONTENT)
 async def unsubscribe(req: UnsubscribeRequest):
     pipeline = getattr(app.state, "_market_data_pipeline", None)
     if pipeline is None:
-        raise HTTPException(status_code=status.HTTP_503_SERVICE_UNAVAILABLE, detail="market-data pipeline not running")
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail="market-data pipeline not running",
+        )
     try:
-        await pipeline.unsubscribe_for_bot(user_id=req.user_id, symbol=req.symbol, bot_id=req.bot_id)
-        log.info("Stopped subscription for user=%s symbol=%s bot=%s", req.user_id, req.symbol, req.bot_id)
+        await pipeline.unsubscribe_for_bot(
+            user_id=req.user_id, symbol=req.symbol, bot_id=req.bot_id
+        )
+        log.info(
+            "Stopped subscription for user=%s symbol=%s bot=%s", req.user_id, req.symbol, req.bot_id
+        )
         return Response(status_code=status.HTTP_204_NO_CONTENT)
-    except Exception:
-        log.exception("Failed to stop subscription for user=%s symbol=%s bot=%s", req.user_id, req.symbol, req.bot_id)
-        raise HTTPException(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, detail="failed to stop subscription")
+    except Exception as exc:
+        log.exception(
+            "Failed to stop subscription for user=%s symbol=%s bot=%s",
+            req.user_id,
+            req.symbol,
+            req.bot_id,
+        )
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail="failed to stop subscription",
+        ) from exc
 
 
 @app.on_event("startup")

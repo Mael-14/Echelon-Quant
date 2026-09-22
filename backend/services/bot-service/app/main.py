@@ -126,3 +126,23 @@ async def pause_bot(id: str = Path(min_length=1)) -> BotStatus:
         raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail=str(exc)) from exc
     await _persist(id)
     return result
+
+
+@app.post("/api/v1/bots/{id}/emergency-stop", response_model=BotStatus)
+async def emergency_stop_bot(
+    id: str = Path(min_length=1),
+    reason: str = "manual emergency stop",
+) -> BotStatus:
+    """Halt a bot immediately, from any state.
+
+    `BotManager.emergency_stop_bot` existed with no way to reach it over HTTP,
+    which made the kill switch unusable from outside the process. Unlike stop,
+    this does not care what state the bot is in: a lifecycle conflict is not a
+    reason to refuse to halt something that is losing money.
+    """
+    try:
+        result = bot_manager.emergency_stop_bot(id, reason)
+    except KeyError as exc:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=str(exc)) from exc
+    await _persist(id)
+    return result
